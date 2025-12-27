@@ -445,16 +445,21 @@ def iterative_spectral_subtraction(
         if voiced_ratio < 0.05:
             break
 
-        # Check similarity to previous layer to prevent duplicates
+        # Check similarity to previous layers to prevent duplicates
         if layers:
-            prev_f0, prev_conf = layers[-1]
-            n_cmp = min(len(f0), len(prev_f0))
-            sim = _layer_similarity(
-                f0[:n_cmp], conf[:n_cmp], prev_f0[:n_cmp], prev_conf[:n_cmp],
-                conf_thr=0.1, cents_tol=35.0
-            )
-            if sim >= 0.85:
-                # Stop if new layer is too similar to the previous one (duplicate extraction)
+            # FIX: Check against ALL previous layers, not just the last one.
+            # Residual artifacts can sometimes resurface a pitch found 2 layers ago.
+            is_dup = False
+            for prev_f0, prev_conf in layers:
+                n_cmp = min(len(f0), len(prev_f0))
+                sim = _layer_similarity(
+                    f0[:n_cmp], conf[:n_cmp], prev_f0[:n_cmp], prev_conf[:n_cmp],
+                    conf_thr=0.1, cents_tol=35.0
+                )
+                if sim >= 0.85:
+                    is_dup = True
+                    break
+            if is_dup:
                 break
 
         # STFT -> apply harmonic mask -> iSTFT
@@ -538,6 +543,12 @@ def iterative_spectral_subtraction(
             # Soft subtraction with decay (Step 4)
             # We assume eff_strength_scale handles the soft nature.
             soft_mask = 1.0 - (1.0 - mask) * strength
+            
+            # FIX: Clip negative values. If strength > 1.0, soft_mask becomes negative,
+            # inverting phase in the residual. This inverted signal is often re-detected
+            # as a new note in the next iteration.
+            soft_mask = np.maximum(0.0, soft_mask)
+            
             Z2 = Z * soft_mask
 
             _, residual2 = scipy.signal.istft(

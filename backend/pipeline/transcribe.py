@@ -132,6 +132,66 @@ def _safe_trace(x: Any) -> Dict[str, Any]:
     return {"raw": x}
 
 
+def _assemble_resolved_params(
+    cand_cfg: PipelineConfig,
+    meta: Any,
+    decision_trace: Dict[str, Any],
+    candidate_id: str,
+    cand_score: float,
+    cand_metrics: Dict[str, Any],
+    quality_gate_cfg: Dict[str, Any],
+    hop_sec: float,
+    tb_source: str,
+    timeline_source: str,
+    time_grid: Optional[List[float]],
+) -> Dict[str, Any]:
+    """Assemble the unified resolved parameter view."""
+    
+    def _extract_routing_reasons(dt: Dict[str, Any]) -> List[str]:
+        return dt.get("routing_reasons", []) or [r["rule_id"] for r in dt.get("rule_hits", []) if r.get("passed")]
+
+    resolved = {
+        "timebase": {
+            "sample_rate": getattr(meta, "sample_rate", 0),
+            "hop_length": getattr(meta, "hop_length", 0),
+            "window_size": getattr(meta, "window_size", 0),
+            "frame_hop_seconds": float(hop_sec),
+            "frame_hop_seconds_source": str(tb_source),
+            "timeline_source": str(timeline_source),
+            "time_grid_available": bool(time_grid is not None and len(time_grid) > 0),
+        },
+        "preprocessing": {
+            "lc_filter_mode": "on" if getattr(cand_cfg.stage_a, "high_pass_filter", {}).get("enabled") else "off",
+            "target_sr": getattr(cand_cfg.stage_a, "target_sample_rate", None),
+        },
+        "detectors": {
+            "ensemble_weights": dict(getattr(cand_cfg.stage_b, "ensemble_weights", {})),
+            "detectors_config": dict(getattr(cand_cfg.stage_b, "detectors", {})),
+        },
+        "segmentation": {
+            "segmentation_method": getattr(cand_cfg.stage_c, "segmentation_method", "threshold"),
+            "onsets_enabled": getattr(cand_cfg.stage_c, "use_onset_refinement", True),
+            "polyphony_enabled": bool(getattr(cand_cfg.stage_c.polyphony_filter, "mode", "off") != "off"),
+        },
+        "post_processing": {
+            "quantize_grid": getattr(cand_cfg.stage_d, "quantization_grid", 16),
+            "quantize_mode": getattr(cand_cfg.stage_d, "quantization_mode", "grid"),
+            "chord_snap_ms": getattr(cand_cfg.stage_c, "chord_onset_snap_ms", 25.0),
+            "merge_gap_ms": getattr(cand_cfg.stage_c.gap_filling, "max_gap_ms", 60.0),
+        },
+        "scoring_routing": {
+            "candidate_id": str(candidate_id),
+            "quality_score": float(cand_score),
+            "quality_metrics": dict(cand_metrics),
+            "quality_gate_threshold": float(quality_gate_cfg.get("threshold", 0.45)),
+            "quality_gate_enabled": bool(quality_gate_cfg.get("enabled", True)),
+            "routing_reasons": _extract_routing_reasons(decision_trace),
+            "decision_trace": decision_trace,
+        },
+    }
+    return resolved
+
+
 def transcribe(
     audio_path: str,
     config: Optional[PipelineConfig] = None,
@@ -368,6 +428,25 @@ def transcribe(
                 if timeline_synth_diag:
                     cand_analysis.diagnostics["timeline_synth"] = timeline_synth_diag
                 cand_analysis.diagnostics["frame_hop_seconds_source"] = frame_hop_source
+                
+                # REPORT 3: Unified resolved params (pre-Stage C)
+                # We calculate metrics/score temporarily just for the snapshot (final score used for gate logic)
+                _tmp_metrics = _quality_metrics([], duration_sec) # Placeholder, updated later if needed
+                
+                resolved_params = _assemble_resolved_params(
+                    cand_cfg,
+                    stage_b_out.meta,
+                    cand_trace,
+                    cand_id,
+                    0.0, # Score placeholder
+                    _tmp_metrics,
+                    qcfg,
+                    frame_hop_seconds,
+                    frame_hop_source,
+                    timeline_source,
+                    time_grid_ref
+                )
+                cand_analysis.diagnostics["resolved_params"] = resolved_params
 
                 # Stage C — IMPORTANT: capture returned notes
                 notes_pred = apply_theory(cand_analysis, cand_cfg)
@@ -397,6 +476,13 @@ def transcribe(
             timeline_src = cand_analysis.timeline if (cand_analysis.timeline and len(cand_analysis.timeline) > 0) else None
             cand_metrics = _quality_metrics(notes_raw, duration_sec, timeline_source=timeline_src)
             cand_score = _quality_score(cand_metrics)
+
+            # Update resolved params with actual score/metrics
+            if cand_analysis and getattr(cand_analysis, "diagnostics", None):
+                 rp = cand_analysis.diagnostics.get("resolved_params")
+                 if rp:
+                     rp["scoring_routing"]["quality_score"] = float(cand_score)
+                     rp["scoring_routing"]["quality_metrics"] = dict(cand_metrics)
 
             accepted = (not q_enabled) or (
                 int(cand_metrics.get("note_count", 0)) > 0 and cand_score >= q_threshold

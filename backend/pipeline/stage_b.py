@@ -344,6 +344,7 @@ def compute_decision_trace(
         },
         "routing_features": dict(routing_features),
         "rule_hits": list(rule_hits),
+        "routing_reasons": [r["rule_id"] for r in rule_hits if r.get("passed")],
         "separation": {
             "ran": False,
             "backend": "none",

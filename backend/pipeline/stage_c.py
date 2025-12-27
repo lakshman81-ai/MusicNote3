@@ -1039,7 +1039,23 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
             has_distinct_poly = _has_distinct_poly_layers(timeline)
 
             if poly_frames or enable_polyphony:
-                voice_conf_gate = poly_conf if vidx == 0 else accomp_conf
+                # FIX: Logic flaw in poly thresholding.
+                # Previously: voice_conf_gate = poly_conf if vidx == 0 else accomp_conf
+                # This applied the high 'melody' threshold (0.55) to ALL voices in the mix stem,
+                # killing quiet inner voices.
+                
+                # New Logic: Top voice (sub_idx 0) gets melody threshold.
+                # All other decomposed voices get accompaniment threshold.
+                # We apply this logic later inside the voice loop, or set a base here.
+                
+                # Base gate selection:
+                if vidx == 0:
+                     # For the primary mix stem, we defer specific gating to the sub_idx loop below
+                     # or set a safe default here. Let's stick to poly_conf but override below.
+                     voice_conf_gate = poly_conf
+                else:
+                     voice_conf_gate = accomp_conf
+
                 try:
                     if min_note_dur_ms_poly is not None:
                         voice_min_dur_s = max(voice_min_dur_s, float(min_note_dur_ms_poly) / 1000.0)
@@ -1051,11 +1067,44 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
             elif vidx > 0:
                 voice_conf_gate = max(voice_conf_gate, accomp_conf)
 
-            hop_s = _estimate_hop_seconds(timeline)
+            # REPORT 3: Use resolved hop hint if available for consistency
+            hop_hint = float(_get(analysis_data.diagnostics, "resolved_params.timebase.frame_hop_seconds", 0.0) or 0.0)
+            if hop_hint > 0.0:
+                hop_s = hop_hint
+            else:
+                hop_s = _estimate_hop_seconds(timeline)
+            
+            # Record per-voice settings for diagnostics
+            if "voice_details" not in analysis_data.diagnostics:
+                 analysis_data.diagnostics["voice_details"] = []
+            
+            analysis_data.diagnostics["voice_details"].append({
+                "stem": _vname,
+                "voice_index": vidx,
+                "poly_frames": bool(poly_frames),
+                "enable_polyphony": bool(enable_polyphony),
+                "poly_filter_mode": str(poly_filter_mode),
+                "base_conf_gate": float(voice_conf_gate),
+                "hop_seconds": float(hop_s),
+            })
+
 
             for sub_idx, sub_tl in enumerate(voice_timelines):
                 if not any(fp.pitch_hz > 0 for fp in sub_tl):
                     continue
+                
+                # FIX: Apply specific threshold for inner voices
+                current_voice_gate = voice_conf_gate
+                if (poly_frames or enable_polyphony) and sub_idx > 0:
+                    current_voice_gate = accomp_conf
+                
+                # Append sub-voice detail
+                if "voice_details" in analysis_data.diagnostics and analysis_data.diagnostics["voice_details"]:
+                     analysis_data.diagnostics["voice_details"][-1].setdefault("sub_voices", []).append({
+                         "sub_idx": sub_idx,
+                         "final_gate": float(current_voice_gate),
+                         "min_dur_s": float(voice_min_dur_s)
+                     })
 
                 use_viterbi = smoothing_enabled and seg_method in ("viterbi", "hmm")
                 if poly_filter_mode == "skyline_top_voice":
@@ -1075,7 +1124,7 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
                         mask=mask,
                         hop_s=hop_s,
                         min_note_dur_s=voice_min_dur_s,
-                        min_conf=voice_conf_gate,
+                        min_conf=current_voice_gate, # Use refined gate
                         min_rms=min_rms,
                     )
                 else:
@@ -1085,12 +1134,12 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
 
                     segs = _segment_monophonic(
                         timeline=sub_tl,
-                        conf_thr=voice_conf_gate,
+                        conf_thr=current_voice_gate, # Use refined gate
                         min_note_dur_s=voice_min_dur_s,
                         gap_tolerance_s=gap_tolerance_s,
                         min_rms=min_rms,
-                        conf_start=max(start_conf, voice_conf_gate),
-                        conf_end=min(max(end_conf, 0.0), max(start_conf, voice_conf_gate)),
+                        conf_start=max(start_conf, current_voice_gate),
+                        conf_end=min(max(end_conf, 0.0), max(start_conf, current_voice_gate)),
                         seg_cfg=seg_cfg_local,
                         hop_s=hop_s,
                     )

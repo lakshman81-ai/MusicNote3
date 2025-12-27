@@ -26,5 +26,12 @@ BENCHMARK_LEVELS = [
         "examples": ["old_macdonald_poly_full"],
         "polyphony": "polyphonic_full",
         "dominant_voice": "none",
+    },
+    {
+        "id": "L7_REAL_AUDIO",
+        "description": "Real audio recordings (no synthesis).",
+        "examples": ["7.1_Music1", "7.2_Music2", "L7.3"],
+        "polyphony": "polyphonic",
+        "dominant_voice": "varied",
     }
 ]

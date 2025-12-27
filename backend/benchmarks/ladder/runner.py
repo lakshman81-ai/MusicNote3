@@ -34,10 +34,13 @@ class NumpyEncoder(json.JSONEncoder):
             return obj.tolist()
         return super(NumpyEncoder, self).default(obj)
 
-def run_full_benchmark(config: Any, output_dir: str = "benchmark_results") -> Dict[str, Any]:
+from typing import Dict, Any, List, Optional
+
+def run_full_benchmark(config: Any, output_dir: str = "benchmark_results", target_levels: Optional[List[str]] = None) -> Dict[str, Any]:
     """
     Runs the full benchmark ladder.
     config: PipelineConfig object.
+    target_levels: List of level IDs to run. If None, runs all.
     """
     from pipeline.stage_a import load_and_preprocess
     from pipeline.stage_b import extract_features
@@ -51,6 +54,10 @@ def run_full_benchmark(config: Any, output_dir: str = "benchmark_results") -> Di
 
     for level in BENCHMARK_LEVELS:
         level_id = level["id"]
+        if target_levels and level_id not in target_levels:
+            continue
+            
+        print(f"Running Level: {level_id}")
         print(f"Running Level: {level_id}")
         level_results = []
 
@@ -59,19 +66,35 @@ def run_full_benchmark(config: Any, output_dir: str = "benchmark_results") -> Di
             example_res = {"id": example_id, "errors": []}
 
             try:
-                # 1. Generate Ground Truth (MIDI)
-                # We need a fresh Score object
-                score = generate_benchmark_example(example_id)
-                midi_path = os.path.join(output_dir, f"{example_id}.mid")
-                score.write("midi", fp=midi_path)
-
-                # 2. Synthesize Audio (WAV)
-                wav_path = os.path.join(output_dir, f"{example_id}.wav")
-                midi_to_wav_synth(score, wav_path)
+                # Check for existing audio file in the ladder directory
+                ladder_dir = os.path.dirname(os.path.abspath(__file__))
+                existing_wav = os.path.join(ladder_dir, f"{example_id}.wav")
+                
+                midi_path = None
+                
+                if os.path.exists(existing_wav):
+                    print(f"    Using existing audio: {existing_wav}")
+                    wav_path = existing_wav
+                    # Check for pre-existing MIDI ground truth
+                    existing_mid = os.path.join(ladder_dir, f"{example_id}.mid")
+                    if os.path.exists(existing_mid):
+                        midi_path = existing_mid
+                    else:
+                        print("    No ground truth MIDI found, skipping reference metrics.")
+                else:
+                    # 1. Generate Ground Truth (MIDI)
+                    # We need a fresh Score object
+                    score = generate_benchmark_example(example_id)
+                    midi_path = os.path.join(output_dir, f"{example_id}.mid")
+                    score.write("midi", fp=midi_path)
+    
+                    # 2. Synthesize Audio (WAV)
+                    wav_path = os.path.join(output_dir, f"{example_id}.wav")
+                    midi_to_wav_synth(score, wav_path)
 
                 # 3. Stage A
                 # Import inside loop to handle reloading if needed? No.
-                stage_a_out = load_and_preprocess(wav_path, config=config.stage_a)
+                stage_a_out = load_and_preprocess(wav_path, config=config)
 
                 # Stage A Metrics
                 ma = calculate_stage_a_metrics(
@@ -85,8 +108,11 @@ def run_full_benchmark(config: Any, output_dir: str = "benchmark_results") -> Di
                 stage_b_out = extract_features(stage_a_out, config=config)
 
                 # Stage B Metrics
-                mb = calculate_stage_b_metrics(stage_b_out, midi_path)
-                example_res["stage_b_metrics"] = mb
+                if midi_path:
+                    mb = calculate_stage_b_metrics(stage_b_out, midi_path)
+                    example_res["stage_b_metrics"] = mb
+                else:
+                    example_res["stage_b_metrics"] = None
 
                 # 5. Stage C
                 from pipeline.models import AnalysisData
@@ -105,8 +131,11 @@ def run_full_benchmark(config: Any, output_dir: str = "benchmark_results") -> Di
                      raise ImportError("Could not find Stage C apply_theory")
 
                 # Stage C Metrics
-                mc = calculate_stage_c_metrics(notes, midi_path)
-                example_res["stage_c_metrics"] = mc
+                if midi_path:
+                    mc = calculate_stage_c_metrics(notes, midi_path)
+                    example_res["stage_c_metrics"] = mc
+                else:
+                    example_res["stage_c_metrics"] = None
 
                 # 6. Stage D
                 # Stage D quantize_and_render expects List[NoteEvent], AnalysisData, Config
@@ -115,15 +144,18 @@ def run_full_benchmark(config: Any, output_dir: str = "benchmark_results") -> Di
                 import pipeline.stage_d as stage_d_module
                 if hasattr(stage_d_module, "quantize_and_render"):
                     xml_path = os.path.join(output_dir, f"{example_id}_out.musicxml")
-                    xml_content = stage_d_module.quantize_and_render(notes, analysis_data, config=config)
+                    trans_result = stage_d_module.quantize_and_render(notes, analysis_data, config=config)
                     with open(xml_path, "w") as f:
-                        f.write(xml_content)
+                        f.write(trans_result.musicxml)
                 else:
                     raise ImportError("Could not find Stage D entry point")
 
                 # Stage D Metrics
-                md = calculate_stage_d_metrics(xml_path, midi_path)
-                example_res["stage_d_metrics"] = md
+                if midi_path:
+                    md = calculate_stage_d_metrics(xml_path, midi_path)
+                    example_res["stage_d_metrics"] = md
+                else:
+                    example_res["stage_d_metrics"] = None
 
             except Exception as e:
                 print(f"    Error: {e}")
