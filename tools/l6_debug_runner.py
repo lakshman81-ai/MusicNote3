@@ -6,11 +6,16 @@ import uuid
 import logging
 import itertools
 import numpy as np
-import soundfile as sf
 from dataclasses import asdict
 
 # Ensure we can import backend
 sys.path.append(os.getcwd())
+
+try:
+    import soundfile as sf
+except ImportError:
+    print("soundfile is required for l6_debug_runner. Please install via `pip install soundfile`.")
+    sys.exit(2)
 
 try:
     from backend.pipeline.transcribe import transcribe
@@ -36,15 +41,24 @@ def ensure_dirs(run_id):
 def get_l6_config():
     """Mimic L6 config from benchmark_runner.py"""
     config = PipelineConfig()
+
+    # Runner override: force polyphonic pathway for L6 (lead + chords + bass)
     try:
-        config.stage_b.separation["enabled"] = False
+        config.stage_b.transcription_mode = "classic_song"
     except Exception:
         pass
 
+    # Enable synthetic separation to peel sine-based stems; disable synthetic-like bypass
     try:
-        config.stage_b.transcription_mode = "e2e_basic_pitch"
+        config.stage_b.separation["enabled"] = True
+        config.stage_b.separation["synthetic_model"] = True
+        config.stage_b.separation.setdefault("harmonic_masking", {})["enabled"] = True
+        config.stage_b.separation["harmonic_masking"]["mask_width"] = 0.03
+        config.stage_b.separation.setdefault("gates", {})
+        config.stage_b.separation["gates"]["bypass_if_synthetic_like"] = False
     except Exception:
         pass
+
     try:
         config.stage_c.polyphony_filter["mode"] = "skyline_top_voice"
     except Exception:
@@ -52,6 +66,10 @@ def get_l6_config():
             config.stage_c.polyphony_filter = {"mode": "skyline_top_voice"}
         except Exception:
             pass
+    try:
+        config.stage_c.skyline_bias = {"enabled": True, "weight": 0.1}
+    except Exception:
+        pass
 
     try:
         config.stage_b.melody_filtering.update(
@@ -67,6 +85,9 @@ def get_l6_config():
                      config.stage_b.detectors[det]["enabled"] = False
                 else:
                      config.stage_b.detectors[det]["enabled"] = True
+
+            # Runner bias: raise fmin to reduce bass bleed in synthetic pop lead
+            config.stage_b.detectors[det]["fmin"] = 180.0
         except Exception:
             pass
             
@@ -98,7 +119,7 @@ def run_baseline(run_id):
     gt = BenchmarkSuite._score_to_gt(score, parts=["Lead"])
 
     wav_path = os.path.join(SNAPSHOTS_DIR, run_id, "L6_synthetic_pop_song.wav")
-    midi_to_wav_synth(score, wav_path, sr=sr)
+    midi_to_wav_synth(score, wav_path, sr=sr, use_enhanced_synth=True)
 
     config = get_l6_config()
 
@@ -125,7 +146,40 @@ def run_baseline(run_id):
     with open(os.path.join(SNAPSHOTS_DIR, run_id, "L6_synthetic_pop_song_metrics.json"), "w") as f:
         json.dump(metrics, f, indent=2)
 
-    diagnostics = res.analysis_data.diagnostics
+    diagnostics = res.analysis_data.diagnostics or {}
+    runner_overrides = {
+        "stage_b.transcription_mode": "classic_song",
+        "stage_b.separation.enabled": True,
+        "stage_b.separation.synthetic_model": True,
+        "stage_b.detectors.fmin_override": 180.0,
+        "synth_profile": "enhanced",
+    }
+    diagnostics["runner_overrides"] = runner_overrides
+
+    # Health flags
+    health_flags = []
+    voiced_ratio = symptoms.get("voiced_ratio")
+    frag_score = symptoms.get("fragmentation_score")
+    if voiced_ratio is not None and voiced_ratio < 0.25:
+        health_flags.append("voiced_ratio_low")
+    if len(pred_list) == 0:
+        health_flags.append("note_count_zero")
+    if frag_score is not None and frag_score > 0.55:
+        health_flags.append("fragmentation_high")
+    if metrics.get("notes_per_sec") and metrics["notes_per_sec"] > 12:
+        health_flags.append("note_density_high")
+    diagnostics["health_flags"] = health_flags
+
+    # Frame CSV export for quick drift inspection
+    timeline = getattr(res.analysis_data, "timeline", []) or []
+    csv_path = os.path.join(SNAPSHOTS_DIR, run_id, "L6_synthetic_pop_song_timeline.csv")
+    with open(csv_path, "w") as csvf:
+        csvf.write("idx,time_sec,chosen_hz,chosen_midi,confidence,active_pitches_count\n")
+        for idx, frame in enumerate(timeline):
+            apc = len(getattr(frame, "active_pitches", []) or [])
+            midi_val = frame.midi if getattr(frame, "midi", None) is not None else ""
+            csvf.write(f"{idx},{frame.time:.6f},{frame.pitch_hz:.3f},{midi_val},{frame.confidence:.4f},{apc}\n")
+
     run_info = {
         "diagnostics": diagnostics,
         "decision_trace": diagnostics.get("decision_trace"),
@@ -155,19 +209,95 @@ def run_baseline(run_id):
 
     return metrics, gt, wav_path, diagnostics
 
+def run_salvage(run_id, wav_path, gt, baseline_metrics):
+    """Run salvage passes when baseline quality collapses."""
+    triggers = []
+    if baseline_metrics is None:
+        triggers.append("baseline_failed")
+    else:
+        if baseline_metrics.get("note_count", 0) == 0:
+            triggers.append("note_count_zero")
+        if baseline_metrics.get("voiced_ratio", 1.0) is not None and baseline_metrics.get("voiced_ratio", 1.0) < 0.25:
+            triggers.append("voiced_ratio_low")
+        if baseline_metrics.get("fragmentation_score", 0.0) is not None and baseline_metrics.get("fragmentation_score", 0.0) > 0.55:
+            triggers.append("fragmentation_high")
+        if baseline_metrics.get("notes_per_sec", 0.0) is not None and baseline_metrics.get("notes_per_sec", 0.0) > 10.0:
+            triggers.append("note_density_high")
+
+    if not triggers:
+        return []
+
+    salvage_runs = []
+
+    def _eval_cfg(cfg, label):
+        try:
+            res = transcribe(wav_path, config=cfg)
+            pred_notes = res.analysis_data.notes
+            pred_list = [(n.midi_note, n.start_sec, n.end_sec) for n in pred_notes]
+            f1 = note_f1(pred_list, gt, onset_tol=0.05)
+            onset_mae, _ = onset_offset_mae(pred_list, gt)
+            symptoms = compute_symptom_metrics(pred_list) or {}
+            return {
+                "label": label,
+                "note_f1": f1,
+                "onset_mae_ms": onset_mae * 1000 if onset_mae is not None else None,
+                "note_count": len(pred_list),
+                **symptoms,
+                "error": None,
+            }
+        except Exception as e:
+            return {"label": label, "error": str(e)}
+
+    # Salvage A: recall boost
+    cfg_a = get_l6_config()
+    try:
+        cfg_a.stage_b.confidence_voicing_threshold = max(0.01, cfg_a.stage_b.confidence_voicing_threshold - 0.1)
+    except Exception:
+        pass
+    try:
+        cfg_a.stage_c.confidence_threshold = max(0.01, cfg_a.stage_c.confidence_threshold - 0.1)
+        cfg_a.stage_c.min_note_duration_ms = cfg_a.stage_c.min_note_duration_ms + 10.0
+    except Exception:
+        pass
+    salvage_runs.append(_eval_cfg(cfg_a, "salvage_recall"))
+
+    # Salvage B: precision boost
+    cfg_b = get_l6_config()
+    try:
+        cfg_b.stage_b.confidence_voicing_threshold = cfg_b.stage_b.confidence_voicing_threshold + 0.05
+    except Exception:
+        pass
+    try:
+        cfg_b.stage_c.confidence_threshold = cfg_b.stage_c.confidence_threshold + 0.05
+        if cfg_b.stage_c.post_merge is None:
+            cfg_b.stage_c.post_merge = {}
+        cfg_b.stage_c.post_merge["max_gap_ms"] = 40.0
+        cfg_b.stage_c.chord_onset_snap_ms = 15.0
+    except Exception:
+        pass
+    salvage_runs.append(_eval_cfg(cfg_b, "salvage_precision"))
+
+    # Log triggers
+    for r in salvage_runs:
+        r["salvage_triggers"] = triggers
+    with open(os.path.join(SNAPSHOTS_DIR, run_id, "L6_salvage_results.json"), "w") as f:
+        json.dump(salvage_runs, f, indent=2)
+    return salvage_runs
+
 def run_sweep(run_id, wav_path, gt):
     logger.info("Running L6 Sweep...")
 
     gaps = [40, 60, 80]
     snaps = [15, 25, 35]
-    thrs = [0.35, 0.45, 0.55]
+    voicing_thrs = [0.35, 0.45, 0.55]
+    fmins = [180.0, 220.0]
 
-    combos = list(itertools.product(gaps, snaps, thrs))[:9]
+    combos = list(itertools.product(gaps, snaps, voicing_thrs, fmins))[:18]
 
     results = []
 
-    for gap, snap, thr in combos:
-        logger.info(f"Sweep: gap={gap}, snap={snap}, thr={thr}")
+    for gap, snap, thr, fmin_val in combos:
+        logger.info(f"Sweep: gap={gap}, snap={snap}, voicing_thr={thr}, fmin={fmin_val}")
         cfg = get_l6_config()
 
         if cfg.stage_c.post_merge is None:
@@ -176,9 +306,25 @@ def run_sweep(run_id, wav_path, gt):
 
         cfg.stage_c.chord_onset_snap_ms = float(snap)
 
-        if not hasattr(cfg, "quality_gate"):
-            setattr(cfg, "quality_gate", {})
-        cfg.quality_gate = {"enabled": True, "threshold": float(thr)} # type: ignore
+        # Sweep detector/segmentation sensitivity instead of quality gate
+        try:
+            cfg.stage_b.confidence_voicing_threshold = float(thr)
+        except Exception:
+            pass
+        try:
+            cfg.stage_c.confidence_threshold = float(thr)
+            if hasattr(cfg.stage_c, "confidence_hysteresis"):
+                cfg.stage_c.confidence_hysteresis["start"] = float(max(thr, cfg.stage_c.confidence_hysteresis.get("start", thr)))
+                cfg.stage_c.confidence_hysteresis["end"] = float(min(thr, cfg.stage_c.confidence_hysteresis.get("end", thr)))
+        except Exception:
+            pass
+        # Sweep fmin bias (runner-scoped)
+        for det in ["rmvpe", "crepe", "swiftf0", "yin"]:
+            try:
+                if det in cfg.stage_b.detectors:
+                    cfg.stage_b.detectors[det]["fmin"] = float(fmin_val)
+            except Exception:
+                pass
 
         try:
             res = transcribe(wav_path, config=cfg)
@@ -194,7 +340,7 @@ def run_sweep(run_id, wav_path, gt):
             dt = diag.get("decision_trace", {}).get("resolved", {})
 
             row = {
-                "gap": gap, "snap": snap, "thr": thr,
+                "gap": gap, "snap": snap, "voicing_thr": thr, "fmin": fmin_val,
                 "note_f1": f1,
                 "onset_mae_ms": onset_mae * 1000 if onset_mae is not None else None,
                 "voiced_ratio": symptoms.get("voiced_ratio"),
@@ -215,7 +361,7 @@ def run_sweep(run_id, wav_path, gt):
 
     return results
 
-def generate_reports(baseline_metrics, sweep_results, diagnostics):
+def generate_reports(baseline_metrics, sweep_results, diagnostics, salvage_results=None):
     md = "# L6 Accuracy Report\n\n"
     if baseline_metrics:
         md += "## Headline Metrics (Baseline)\n"
@@ -263,6 +409,7 @@ def main():
     ensure_dirs(run_id)
 
     metrics, gt, wav_path, diagnostics = run_baseline(run_id)
+    salvage_results = run_salvage(run_id, wav_path, gt, metrics)
 
     if wav_path and os.path.exists(wav_path):
         sweep_results = run_sweep(run_id, wav_path, gt)
@@ -270,7 +417,7 @@ def main():
         sweep_results = []
         logger.error("WAV generation failed, skipping sweep.")
 
-    generate_reports(metrics, sweep_results, diagnostics)
+    generate_reports(metrics, sweep_results, diagnostics, salvage_results)
 
     required = [
         "reports/bench_run.log",

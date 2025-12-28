@@ -2,7 +2,8 @@
 import pytest
 import numpy as np
 from backend.pipeline.stage_c import apply_theory, quantize_notes
-from backend.pipeline.models import NoteEvent, AnalysisData, MetaData, FramePitch
+from backend.pipeline.models import NoteEvent, AnalysisData, MetaData, FramePitch, AudioType
+from backend.pipeline.config import PipelineConfig
 
 def test_stage_c_segmentation():
     # Setup timeline with stable pitch
@@ -64,3 +65,73 @@ def test_stage_c_quantization():
     # Measure 1, Beat 3.0
     assert q.measure == 1
     assert q.beat == 3.0
+
+
+def _build_timeline(pitches, *, hop=0.01, poly=False):
+    timeline = []
+    for i, hz in enumerate(pitches):
+        midi = None
+        active = []
+        conf = 0.9 if hz > 0 else 0.0
+        if hz > 0:
+            midi = int(round(69 + 12 * np.log2(hz / 440.0)))
+            active = [(hz, conf)]
+            if poly:
+                active.append((hz * 1.5, conf * 0.5))
+        timeline.append(
+            FramePitch(
+                time=i * hop,
+                pitch_hz=hz,
+                midi=midi,
+                confidence=conf,
+                rms=0.1,
+                active_pitches=active,
+            )
+        )
+    return timeline
+
+
+def test_apply_theory_uses_poly_context_for_secondary_stems():
+    cfg = PipelineConfig()
+    cfg.stage_c.segmentation_method = {"method": "threshold"}
+    cfg.stage_c.confidence_threshold = 0.05
+    cfg.stage_c.confidence_hysteresis = {"start": 0.05, "end": 0.05}
+
+    stem_a = _build_timeline([0, 0] + [261.63] * 6 + [0, 0])  # C4
+    stem_b = _build_timeline([0, 0] + [329.63] * 6 + [0, 0])  # E4
+
+    meta = MetaData(audio_type=AudioType.MONOPHONIC)
+    analysis = AnalysisData(
+        meta=meta,
+        stem_timelines={"mix": stem_a, "other": stem_b},
+        diagnostics={"polyphonic_context": True},
+    )
+
+    notes = apply_theory(analysis, cfg)
+
+    assert len(notes) == 2
+    assert {n.midi_note for n in notes} == {
+        stem_a[2].midi,
+        stem_b[2].midi,
+    }
+    assert analysis.diagnostics["stage_c"]["polyphonic_context"]["polyphonic_context_resolved"] is True
+
+
+def test_poly_min_duration_override_respected():
+    cfg = PipelineConfig()
+    cfg.stage_c.segmentation_method = {"method": "threshold"}
+    cfg.stage_c.confidence_threshold = 0.05
+    cfg.stage_c.confidence_hysteresis = {"start": 0.05, "end": 0.05}
+    cfg.stage_c.min_note_duration_ms = 80.0
+    cfg.stage_c.min_note_duration_ms_poly = 30.0
+
+    # 5 frames @10ms each -> 50ms duration, should pass via poly override (30ms)
+    stem = _build_timeline([0, 440.0, 440.0, 440.0, 0], poly=True)
+    meta = MetaData(audio_type=AudioType.POLYPHONIC)
+    analysis = AnalysisData(meta=meta, stem_timelines={"mix": stem})
+
+    notes = apply_theory(analysis, cfg)
+
+    assert len(notes) == 1
+    voice_settings = analysis.diagnostics["stage_c"]["voice_settings"][0]
+    assert pytest.approx(voice_settings["voice_min_note_dur_ms"], rel=1e-3) == 30.0
