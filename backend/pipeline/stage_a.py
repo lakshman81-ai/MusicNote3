@@ -247,6 +247,81 @@ def _estimate_noise_floor(audio: np.ndarray, percentile: float = 30.0, hop_lengt
     return noise_rms, noise_db
 
 
+def _compute_mixture_complexity(audio: np.ndarray, sr: int, max_duration_sec: float = 20.0) -> Dict[str, Any]:
+    """
+    Estimate a lightweight mixture complexity score combining spectral flatness
+    and a coarse polyphony estimate.
+    """
+    result: Dict[str, Any] = {
+        "spectral_flatness": 0.0,
+        "polyphony": 0.0,
+        "score": 0.0,
+        "duration_analyzed": 0.0,
+    }
+
+    if sr <= 0 or audio.size == 0:
+        return result
+
+    y = np.asarray(audio, dtype=np.float32).reshape(-1)
+    if max_duration_sec > 0:
+        max_samples = int(max_duration_sec * sr)
+        if max_samples > 0:
+            y = y[:max_samples]
+
+    result["duration_analyzed"] = float(len(y)) / float(sr)
+
+    flatness = 0.0
+    polyphony = 0.0
+    method = "fallback"
+
+    if librosa is not None:
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                flat = librosa.feature.spectral_flatness(y=y)
+                flatness = float(np.mean(flat)) if flat.size else 0.0
+
+                pitches, mags = librosa.piptrack(
+                    y=y,
+                    sr=sr,
+                    hop_length=512,
+                    fmin=80.0,
+                    fmax=min(2000.0, sr / 2.2),
+                )
+                if mags.size:
+                    thr = float(np.percentile(mags, 90)) * 0.10
+                    active = mags > max(1e-8, thr)
+                    counts = np.sum(active, axis=0).astype(np.float32)
+                    polyphony = float(np.mean(counts)) if counts.size else 0.0
+                method = "librosa_flatness_piptrack"
+        except Exception:
+            flatness = 0.0
+            polyphony = 0.0
+
+    if flatness <= 0.0:
+        clip = y[: min(len(y), int(sr))]
+        spectrum = np.abs(np.fft.rfft(clip))
+        if spectrum.size:
+            flatness = float(np.exp(np.mean(np.log(spectrum + 1e-9))) / (np.mean(spectrum) + 1e-9))
+            method = "fft_flatness"
+
+    if polyphony <= 0.0:
+        inferred_type = detect_audio_type(y, sr)
+        polyphony = 2.0 if inferred_type == AudioType.POLYPHONIC else (1.3 if inferred_type == AudioType.POLYPHONIC_DOMINANT else 1.0)
+        method = method or "audio_type_inferred"
+
+    poly_norm = float(np.clip(polyphony / 6.0, 0.0, 1.0))
+    score = float(np.clip(0.55 * min(flatness, 1.0) + 0.45 * poly_norm, 0.0, 1.0))
+
+    result.update({
+        "spectral_flatness": float(flatness),
+        "polyphony": float(polyphony),
+        "score": score,
+        "method": method,
+    })
+    return result
+
+
 def detect_tempo_and_beats(
     audio: np.ndarray,
     sr: int,
@@ -544,6 +619,11 @@ def load_and_preprocess(
     # 6. Detect texture (mono / poly)
     detected_type = detect_audio_type(audio, sr)
 
+    # 6b. Estimate mixture complexity to inform Stage B separation gating
+    mix_complexity = _compute_mixture_complexity(audio, sr)
+    if pipeline_logger:
+        pipeline_logger.log_event("stage_a", "mixture_complexity", payload=mix_complexity)
+
     # 7. Populate Metadata & Output
     # Basic MetaData
     meta = MetaData(
@@ -562,6 +642,9 @@ def load_and_preprocess(
         noise_floor_rms=nf_rms,
         noise_floor_db=nf_db,
         pipeline_version="2.0.0",
+        spectral_flatness_mean=float(mix_complexity.get("spectral_flatness", 0.0)),
+        polyphony_estimate=float(mix_complexity.get("polyphony", 0.0)),
+        mixture_complexity_score=float(mix_complexity.get("score", 0.0)),
 
         # Instrument (Patch C1)
         # Attempt to set instrument if explicitly provided in kwargs or config, but don't force default.
@@ -589,5 +672,5 @@ def load_and_preprocess(
         noise_floor_rms=nf_rms,
         noise_floor_db=nf_db,
         beats=beat_times,
-        diagnostics={"bpm": bpm_diag}
+        diagnostics={"bpm": bpm_diag, "mixture_complexity": mix_complexity}
     )

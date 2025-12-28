@@ -86,6 +86,9 @@ class MetaData:
     noise_floor_rms: float = 0.0            # from Stage A percentile RMS
     noise_floor_db: float = -80.0           # log version of noise_floor_rms
     pipeline_version: str = "2.0.0"
+    spectral_flatness_mean: float = 0.0
+    polyphony_estimate: float = 0.0
+    mixture_complexity_score: float = 0.0
 
 
 @dataclass
