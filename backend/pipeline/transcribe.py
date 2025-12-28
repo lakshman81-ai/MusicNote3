@@ -17,6 +17,45 @@ from .stage_d import quantize_and_render
 from .neural_transcription import transcribe_onsets_frames
 
 
+def _time_grid_hop_seconds(time_grid: Any) -> Optional[float]:
+    try:
+        tg = np.asarray(time_grid)
+        if tg is None or len(tg) < 2:
+            return None
+        diffs = np.diff(tg)
+        if diffs.size == 0:
+            return None
+        hop = float(np.median(diffs))
+        return hop if hop > 0 else None
+    except Exception:
+        return None
+
+
+def _config_hop_seconds(meta: Any) -> Optional[float]:
+    try:
+        sr = float(getattr(meta, "sample_rate", 0.0) or getattr(meta, "target_sr", 0.0))
+        hop = float(getattr(meta, "hop_length", 0.0))
+        if sr > 0 and hop > 0:
+            return float(hop / sr)
+    except Exception:
+        return None
+    return None
+
+
+def _hop_mismatch_warning(config_hop: Optional[float], derived_hop: Optional[float]) -> Optional[Dict[str, float]]:
+    if not config_hop or not derived_hop:
+        return None
+    if config_hop <= 0 or derived_hop <= 0:
+        return None
+    diff = abs(config_hop - derived_hop)
+    if diff > max(1e-6, 0.05 * config_hop):
+        return {
+            "config_hop_seconds": float(config_hop),
+            "derived_hop_seconds": float(derived_hop),
+        }
+    return None
+
+
 def _quality_metrics(
     notes: List[NoteEvent],
     duration_sec: float,
@@ -179,17 +218,21 @@ def _build_resolved_params(
 
     tb_source = frame_hop_source
     hop_sec = float(frame_hop_seconds or 0.0)
-    if time_grid is not None and len(time_grid) >= 2:
-        hop_sec = float(np.median(np.diff(time_grid)))
-        tb_source = "stage_b_time_grid"
-    elif hop_sec <= 0.0:
-        try:
-            sr = float(stage_a_out.meta.sample_rate)
-            hop = float(stage_a_out.meta.hop_length)
-            hop_sec = hop / max(sr, 1e-9)
-            tb_source = "stage_a_meta"
-        except Exception:
-            hop_sec = 0.0
+    derived_hop = _time_grid_hop_seconds(time_grid)
+    config_hop = _config_hop_seconds(stage_a_out.meta)
+    hop_warning = None
+
+    if derived_hop is not None:
+        hop_sec = derived_hop
+        tb_source = "time_grid"
+        hop_warning = _hop_mismatch_warning(config_hop, derived_hop)
+    elif hop_sec > 0.0:
+        tb_source = "config" if frame_hop_source == "meta" else frame_hop_source
+    elif config_hop:
+        hop_sec = config_hop
+        tb_source = "config"
+    else:
+        tb_source = "heuristic" if hop_sec <= 0.0 else tb_source
 
     stage_a_conf = getattr(cand_cfg, "stage_a", None)
     stage_b_conf = getattr(cand_cfg, "stage_b", None)
@@ -212,6 +255,7 @@ def _build_resolved_params(
             "window_size": float(getattr(stage_a_out.meta, "window_size", 0.0) or 0.0),
             "frame_hop_seconds": hop_sec,
             "frame_hop_seconds_source": tb_source,
+            "frame_hop_seconds_warning": hop_warning,
             "timeline_source": timeline_source_valid,
             "time_grid_available": bool(time_grid is not None and len(time_grid) > 0),
         },
@@ -407,8 +451,8 @@ def transcribe(
                     diagnostics={
                         "decision_trace": cand_trace,
                         "timeline_source": "e2e_notes",
-                        "frame_hop_seconds_source": "meta",
-                        "frame_hop_seconds": float(getattr(stage_a_out.meta, "hop_length", 512)) / float(getattr(stage_a_out.meta, "sample_rate", 44100)),
+                        "frame_hop_seconds_source": "config",
+                        "frame_hop_seconds": float(_config_hop_seconds(stage_a_out.meta) or 0.0),
                     },
                 )
                 try:
@@ -419,7 +463,7 @@ def transcribe(
                         decision_trace=cand_trace,
                         timeline_source="e2e_notes",
                         frame_hop_seconds=float(cand_analysis.diagnostics["frame_hop_seconds"]),
-                        frame_hop_source="meta",
+                        frame_hop_source="config",
                         cand_score=0.0,
                         cand_metrics={},
                         candidate_id=cand_id,
@@ -483,16 +527,24 @@ def transcribe(
 
                 # B3: Frame hop seconds calculation
                 frame_hop_seconds = 0.0
-                frame_hop_source = "unknown"
+                frame_hop_source = "heuristic"
+                frame_hop_warning = None
 
                 time_grid_ref = getattr(stage_b_out, "time_grid", None)
-                if time_grid_ref is not None and len(time_grid_ref) >= 2:
-                    frame_hop_seconds = float(np.median(np.diff(time_grid_ref)))
-                    frame_hop_source = "stage_b_time_grid"
+                config_hop = _config_hop_seconds(getattr(stage_b_out, "meta", None))
+                time_grid_hop = _time_grid_hop_seconds(time_grid_ref)
+                if time_grid_hop is not None:
+                    frame_hop_seconds = time_grid_hop
+                    frame_hop_source = "time_grid"
+                    frame_hop_warning = _hop_mismatch_warning(config_hop, time_grid_hop)
+                elif config_hop is not None:
+                    frame_hop_seconds = config_hop
+                    frame_hop_source = "config"
                 else:
                     try:
-                        frame_hop_seconds = float(stage_b_out.meta.hop_length) / float(stage_b_out.meta.sample_rate)
-                        frame_hop_source = "meta"
+                        frame_times = [float(fp.time) for fp in (final_timeline or [])]
+                        if len(frame_times) >= 2:
+                            frame_hop_seconds = float(np.median(np.diff(frame_times)))
                     except Exception:
                         pass
 
@@ -516,6 +568,8 @@ def transcribe(
                 cand_analysis.diagnostics = cand_analysis.diagnostics or {}
                 cand_analysis.diagnostics["timeline_source"] = timeline_source
                 cand_analysis.diagnostics["timeline_frames"] = len(final_timeline)
+                if frame_hop_warning:
+                    cand_analysis.diagnostics["frame_hop_seconds_warning"] = frame_hop_warning
                 if timeline_synth_diag:
                     cand_analysis.diagnostics["timeline_synth"] = timeline_synth_diag
                 cand_analysis.diagnostics["frame_hop_seconds_source"] = frame_hop_source
@@ -673,7 +727,7 @@ def transcribe(
     tb = analysis_data.diagnostics.get("resolved_params", {}).get("timebase", {}) if analysis_data.diagnostics else {}
     time_grid_present = tb.get("time_grid_available", False)
     hop_source = tb.get("frame_hop_seconds_source", "")
-    if time_grid_present and hop_source != "stage_b_time_grid":
+    if time_grid_present and hop_source != "time_grid":
         invariants.append({"id": "inv_timegrid_precedence", "ok": False, "details": hop_source})
     if tb.get("timeline_source", "unknown") == "unknown":
         invariants.append({"id": "inv_timeline_enum", "ok": False, "details": "unknown_timeline_source"})
@@ -691,6 +745,7 @@ def transcribe(
         selected_metrics = next((c["metrics"] for c in candidates if c.get("candidate_id") == selected_id), {})
     except Exception:
         selected_metrics = {}
+    hop_warning = tb.get("frame_hop_seconds_warning")
     if selected_metrics:
         if selected_metrics.get("voiced_ratio", 1.0) is not None and selected_metrics.get("voiced_ratio", 1.0) < 0.25:
             health_flags.append("voiced_ratio_low")
@@ -698,6 +753,8 @@ def transcribe(
             health_flags.append("fragmentation_high")
         if selected_metrics.get("notes_per_sec", 0.0) is not None and selected_metrics.get("notes_per_sec", 0.0) > 12.0:
             health_flags.append("note_density_high")
+    if hop_warning:
+        health_flags.append("frame_hop_mismatch")
     if invariants_failed:
         health_flags.append("invariants_failed")
     analysis_data.diagnostics["health_flags"] = health_flags

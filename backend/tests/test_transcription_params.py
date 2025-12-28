@@ -47,7 +47,7 @@ def test_resolved_params_prefers_time_grid_over_meta():
     )
 
     tb = resolved["timebase"]
-    assert tb["frame_hop_seconds_source"] == "stage_b_time_grid"
+    assert tb["frame_hop_seconds_source"] == "time_grid"
     assert tb["frame_hop_seconds"] == pytest.approx(0.02)
     assert tb["timeline_source"] == "synth_from_time_grid"
 
@@ -73,12 +73,12 @@ def test_apply_theory_uses_resolved_timebase_hint():
             "resolved_params": {
                 "timebase": {
                     "frame_hop_seconds": 0.02,
-                    "frame_hop_seconds_source": "resolved",
+                    "frame_hop_seconds_source": "config",
                 }
             },
             "decision_trace": {"routing_reasons": ["R4"], "rule_hits": []},
             "timeline_source": "stage_b_timeline",
-            "frame_hop_seconds_source": "resolved_params",
+            "frame_hop_seconds_source": "config",
         },
     )
 

@@ -211,7 +211,10 @@ def transcribe_audio_pipeline(
 
     frame_hop_seconds = float(meta.hop_length) / float(meta.target_sr)
     if getattr(stage_b_out, "time_grid", None) is not None and len(stage_b_out.time_grid) > 1:
-        frame_hop_seconds = float(stage_b_out.time_grid[1] - stage_b_out.time_grid[0])
+        frame_hop_seconds = float(np.median(np.diff(stage_b_out.time_grid)))
+        frame_hop_source = "time_grid"
+    else:
+        frame_hop_source = "config"
 
     analysis_data = AnalysisData(
         meta=meta,
@@ -227,6 +230,7 @@ def transcribe_audio_pipeline(
         onsets=onsets,
         beats=beats # Add beats
     )
+    analysis_data.diagnostics["frame_hop_seconds_source"] = frame_hop_source
 
     # 4. Stage C: Apply Theory
     events_with_theory = apply_theory(analysis_data, config=pipeline_conf)
