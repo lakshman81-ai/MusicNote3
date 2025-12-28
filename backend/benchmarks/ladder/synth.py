@@ -2,7 +2,35 @@ import numpy as np
 import soundfile as sf
 from music21 import stream, note, chord, tempo
 
-def midi_to_wav_synth(score_stream: stream.Score, wav_path: str, sr: int = 22050, use_enhanced_synth: bool = False):
+def _clamp_bpm(bpm: float, lo: float = 20.0, hi: float = 300.0, default: float = 120.0) -> float:
+    try:
+        bpm = float(bpm)
+    except Exception:
+        return default
+    if not np.isfinite(bpm):
+        return default
+    if bpm < lo or bpm > hi:
+        return default
+    return bpm
+
+def _duration_sec(audio: np.ndarray, sr: int) -> float:
+    if audio is None or sr <= 0:
+        return 0.0
+    return float(len(audio)) / float(sr)
+
+def _duration_ok(audio: np.ndarray, sr: int, expected_sec: float, tol: float = 0.10) -> bool:
+    got = _duration_sec(audio, sr)
+    exp = float(expected_sec)
+    return exp > 0.0 and abs(got - exp) <= exp * float(tol)
+
+
+def midi_to_wav_synth(
+    score_stream: stream.Score,
+    wav_path: str,
+    sr: int = 22050,
+    use_enhanced_synth: bool = False,
+    target_duration_sec: float = 0.0,
+):
     """
     Synthesizes a Music21 stream to a WAV file using simple sine waves.
     Handles polyphony by summing waveforms.
@@ -36,7 +64,8 @@ def midi_to_wav_synth(score_stream: stream.Score, wav_path: str, sr: int = 22050
                     pass
         return 100.0
 
-    current_bpm = _extract_bpm(score_stream)
+    detected_bpm = _extract_bpm(score_stream)
+    current_bpm = _clamp_bpm(detected_bpm, lo=20.0, hi=300.0, default=120.0)
 
     # We need to process chords and notes
     # music21.chord.Chord contains notes.
@@ -56,7 +85,8 @@ def midi_to_wav_synth(score_stream: stream.Score, wav_path: str, sr: int = 22050
     # Calculate duration using our BPM to be consistent
     # score.flatten() puts everything in one timeline
     try:
-        total_dur_sec = score_stream.highestTime * (60.0 / current_bpm)
+        score_dur_beats = float(score_stream.highestTime)
+        total_dur_sec = score_dur_beats * (60.0 / current_bpm)
     except:
         total_dur_sec = 10.0
 
@@ -182,6 +212,18 @@ def midi_to_wav_synth(score_stream: stream.Score, wav_path: str, sr: int = 22050
     max_val = np.max(np.abs(audio))
     if max_val > 0:
         audio = audio / max_val * 0.95
+
+    # Enforce duration if target_duration_sec is provided
+    if target_duration_sec > 0.0:
+        current_len_sec = _duration_sec(audio, sr)
+        if not _duration_ok(audio, sr, target_duration_sec, tol=0.10):
+             # Simple time-stretch via linear interpolation
+             # This is a crude fix but deterministic and dependency-free
+             target_samples = int(target_duration_sec * sr)
+             if abs(target_samples - len(audio)) > 100: # only if significant
+                 old_indices = np.linspace(0, len(audio) - 1, len(audio))
+                 new_indices = np.linspace(0, len(audio) - 1, target_samples)
+                 audio = np.interp(new_indices, old_indices, audio).astype(np.float32)
 
     sf.write(wav_path, audio, sr)
     return wav_path

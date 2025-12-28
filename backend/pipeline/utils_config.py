@@ -1,7 +1,9 @@
+# backend/pipeline/utils_config.py
 from __future__ import annotations
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Mapping, Optional, Sequence, Union
 
-def coalesce_not_none(*vals):
+def coalesce_not_none(*vals: Any) -> Any:
+    """Return the first value that is not None (0 is valid and must be preserved)."""
     for v in vals:
         if v is not None:
             return v
@@ -20,48 +22,55 @@ def safe_setattr(obj: Any, name: str, value: Any) -> bool:
     except Exception:
         return False
 
-def apply_dotted_overrides(cfg: Any, overrides: Dict[str, Any]) -> Dict[str, Any]:
+def apply_dotted_overrides(target: Any, overrides: Mapping[str, Any]) -> None:
     """
-    Applies dotted-path overrides to dataclasses/dicts.
-    Returns dict of successfully applied overrides.
-    Handles intermediate creation of dicts if missing or None.
+    Apply dotted-path overrides into nested dataclasses/objects/dicts.
+    Creates intermediate dicts when needed.
     """
-    applied: Dict[str, Any] = {}
-    for path, val in (overrides or {}).items():
-        try:
-            cur = cfg
-            parts = str(path).split(".")
-            for k in parts[:-1]:
-                if isinstance(cur, dict):
-                    # Dict path
-                    if k not in cur or cur[k] is None:
-                        cur[k] = {}
-                    cur = cur[k]
-                else:
-                    # Object/Dataclass path
-                    # Check if attribute exists, if not or None, try to set as empty dict
-                    if not hasattr(cur, k):
-                        try:
-                            setattr(cur, k, {})
-                        except Exception:
-                            # Cannot set attribute? Stop path
-                            break
+    for path, value in (overrides or {}).items():
+        parts = str(path).split(".")
+        cur = target
+        for i, part in enumerate(parts):
+            last = (i == len(parts) - 1)
 
-                    val_attr = getattr(cur, k)
-                    if val_attr is None:
-                        try:
-                            setattr(cur, k, {})
-                            val_attr = getattr(cur, k)
-                        except Exception:
-                             break
-                    cur = val_attr
-
-            last = parts[-1]
             if isinstance(cur, dict):
-                cur[last] = val
-            else:
-                setattr(cur, last, val)
-            applied[path] = val
-        except Exception:
-            continue
-    return applied
+                if last:
+                    cur[part] = value
+                    break
+                nxt = cur.get(part, None)
+                if nxt is None:
+                    nxt = {}
+                    cur[part] = nxt
+                cur = nxt
+                continue
+
+            # object / dataclass
+            if last:
+                # if attribute exists -> set; else if cur has __dict__ -> set anyway
+                try:
+                    setattr(cur, part, value)
+                except Exception:
+                    # fallback: store into __dict__ if possible
+                    d = getattr(cur, "__dict__", None)
+                    if isinstance(d, dict):
+                        d[part] = value
+                break
+
+            # intermediate: fetch existing
+            nxt = None
+            try:
+                nxt = getattr(cur, part)
+            except Exception:
+                nxt = None
+
+            # if missing, create dict container
+            if nxt is None:
+                nxt = {}
+                try:
+                    setattr(cur, part, nxt)
+                except Exception:
+                    d = getattr(cur, "__dict__", None)
+                    if isinstance(d, dict):
+                        d[part] = nxt
+
+            cur = nxt
