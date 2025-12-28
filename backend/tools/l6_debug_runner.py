@@ -48,6 +48,7 @@ if REPO_ROOT not in sys.path:
 from backend.pipeline.config import PipelineConfig
 from backend.pipeline.instrumentation import PipelineLogger
 from backend.pipeline.transcribe import transcribe
+from backend.pipeline.utils_config import apply_dotted_overrides
 
 from backend.benchmarks.metrics import (
     note_f1,
@@ -420,25 +421,34 @@ def main() -> int:
     base_cfg = suite._apply_suite_determinism(PipelineConfig())
 
     # ✅ FIX 1: FORCE L6 MODE (safety net)
-    _force_l6_mode_on_cfg(base_cfg)
+    # APPLY + log what actually applied
+    runner_overrides = {
+        "stage_b.transcription_mode": "classic_song",
+        "stage_b.separation.enabled": True,
+        "stage_b.separation.synthetic_model": True,
+        # safer than stage_b.detectors.fmin_override (not a schema field in your config)
+        "stage_b.detectors.swiftf0.fmin": 180.0,
+        "stage_b.detectors.yin.fmin": 180.0,
+        "stage_b.detectors.crepe.fmin": 180.0,
+        "synth_profile": "enhanced",
+    }
+    applied = apply_dotted_overrides(base_cfg, runner_overrides)
 
-    # Avoid Demucs on synthetic benches (as in benchmark_runner L6)
+    # Fix RuntimeError in fallback chain
     try:
-        base_cfg.stage_b.separation["enabled"] = False
-    except Exception:
-        pass
-
-    # Encourage lead tracking in a poly mix: limit band to typical lead range
-    try:
-        base_cfg.stage_b.melody_filtering.update(
-            {"fmin_hz": 180.0, "fmax_hz": 1600.0, "voiced_prob_threshold": 0.40}
-        )
+        oaf = getattr(base_cfg.stage_b, "onsets_and_frames", None)
+        if not isinstance(oaf, dict):
+            oaf = {}
+            base_cfg.stage_b.onsets_and_frames = oaf
+        oaf["enabled"] = True
     except Exception:
         pass
 
     # Ensure Stage C is set to extract top voice (Lead-only GT)
     try:
-        base_cfg.stage_c.polyphony_filter = {"mode": "skyline_top_voice"}
+        if not isinstance(base_cfg.stage_c.polyphony_filter, dict):
+            base_cfg.stage_c.polyphony_filter = {}
+        base_cfg.stage_c.polyphony_filter["mode"] = "skyline_top_voice"
     except Exception:
         pass
 
@@ -467,6 +477,7 @@ def main() -> int:
     metrics["timing_total_sec"] = float(elapsed)
 
     diag = getattr(analysis, "diagnostics", {}) or {}
+    diag["runner_overrides"] = applied
     dt = _safe_decision_trace(diag)
 
     run_info = {
@@ -510,9 +521,10 @@ def main() -> int:
     logger.info("Running mini sweep (capped to %d combos) ...", int(args.max_combos))
     max_gap_ms_values = [40.0, 60.0, 80.0]
     snap_ms_values = [15.0, 25.0, 35.0]
-    q_thr_values = [0.35, 0.45, 0.55]
+    # Sweep segmentation threshold (primary), not quality_gate.threshold
+    seg_thr_values = [0.15, 0.20, 0.25]
 
-    combos = list(itertools.product(max_gap_ms_values, snap_ms_values, q_thr_values))
+    combos = list(itertools.product(max_gap_ms_values, snap_ms_values, seg_thr_values))
     combos = combos[: max(0, int(args.max_combos))]
 
     sweep_rows: List[Dict[str, Any]] = []
@@ -520,25 +532,25 @@ def main() -> int:
         cfg = copy.deepcopy(base_cfg)
 
         # ✅ FIX 2: force L6 mode for every sweep candidate (paranoia)
-        _force_l6_mode_on_cfg(cfg)
+        _ = apply_dotted_overrides(cfg, {
+            "stage_b.transcription_mode": "classic_song",
+            "stage_b.separation.enabled": True,
+            "stage_b.separation.synthetic_model": True,
+        })
 
         # Stage C knobs (both new + legacy paths)
         _cfg_set_path(cfg, "stage_c.post_merge.max_gap_ms", float(gap_ms))
         _cfg_set_path(cfg, "stage_c.gap_filling.max_gap_ms", float(gap_ms))  # legacy fallback
         _cfg_set_path(cfg, "stage_c.chord_onset_snap_ms", float(snap_ms))
 
-        # Quality gate knob
-        qg = getattr(cfg, "quality_gate", None)
-        if isinstance(qg, dict):
-            qg["enabled"] = True
-            qg["threshold"] = float(thr)
-            qg.setdefault("max_candidates", 3)
-            setattr(cfg, "quality_gate", qg)
-        else:
-            try:
-                setattr(cfg, "quality_gate", {"enabled": True, "threshold": float(thr), "max_candidates": 3})
-            except Exception:
-                pass
+        # Sweep segmentation threshold (primary)
+        try:
+            cfg.stage_c.confidence_threshold = float(thr)
+            if hasattr(cfg.stage_c, "confidence_hysteresis") and isinstance(cfg.stage_c.confidence_hysteresis, dict):
+                cfg.stage_c.confidence_hysteresis["start"] = float(max(thr, cfg.stage_c.confidence_hysteresis.get("start", thr)))
+                cfg.stage_c.confidence_hysteresis["end"] = float(min(thr, cfg.stage_c.confidence_hysteresis.get("end", thr)))
+        except Exception:
+            pass
 
         t1 = time.time()
         tr_s = _run_transcribe(wav_path, cfg=cfg, device=args.device, pipeline_logger=PipelineLogger())
