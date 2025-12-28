@@ -2,10 +2,13 @@ import numpy as np
 import soundfile as sf
 from music21 import stream, note, chord, tempo
 
-def midi_to_wav_synth(score_stream: stream.Score, wav_path: str, sr: int = 22050):
+def midi_to_wav_synth(score_stream: stream.Score, wav_path: str, sr: int = 22050, use_enhanced_synth: bool = False):
     """
     Synthesizes a Music21 stream to a WAV file using simple sine waves.
     Handles polyphony by summing waveforms.
+
+    If use_enhanced_synth is True, vary timbre/envelope by range to help
+    downstream separation/skyline (saw/square-ish for bass, sine for lead).
     """
     # Flatten the score to get all notes with absolute offsets
     # We use flat, but flat merges parts. We need to respect overlapping notes.
@@ -87,6 +90,18 @@ def midi_to_wav_synth(score_stream: stream.Score, wav_path: str, sr: int = 22050
             for p in el.pitches:
                 events.append((start_sec, dur_sec, p.frequency, vel))
 
+    def _waveform(freq, t, amp):
+        if not use_enhanced_synth:
+            return amp * np.sin(2 * np.pi * freq * t)
+        if freq < 200.0:
+            # Richer bass content (saw-like)
+            return amp * 0.5 * (2.0 * (t * freq - np.floor(t * freq + 0.5)))
+        elif freq < 500.0:
+            # Slightly brighter (square-ish)
+            return amp * np.sign(np.sin(2 * np.pi * freq * t))
+        else:
+            return amp * np.sin(2 * np.pi * freq * t)
+
     # Synthesize
     for start, dur, freq, vel in events:
         if dur <= 0: continue
@@ -100,15 +115,14 @@ def midi_to_wav_synth(score_stream: stream.Score, wav_path: str, sr: int = 22050
         if length <= 0: continue
 
         t = np.arange(length) / sr
-        # Sine wave
-        # Apply envelope: Attack (10ms), Release (10ms)
+        # Apply envelope: Attack/Release
         amp = (vel / 127.0) * 0.3 # Master gain
 
-        wave = amp * np.sin(2 * np.pi * freq * t)
+        wave = _waveform(freq, t, amp)
 
         # Simple envelope
-        attack_s = 0.02
-        release_s = 0.05
+        attack_s = 0.05 if (use_enhanced_synth and freq < 200.0) else 0.02
+        release_s = 0.08 if (use_enhanced_synth and freq < 200.0) else 0.05
         attack_n = int(attack_s * sr)
         release_n = int(release_s * sr)
 

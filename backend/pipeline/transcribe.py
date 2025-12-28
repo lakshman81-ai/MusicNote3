@@ -132,6 +132,135 @@ def _safe_trace(x: Any) -> Dict[str, Any]:
     return {"raw": x}
 
 
+def _extract_routing_reasons(decision_trace: Dict[str, Any]) -> List[str]:
+    reasons = []
+    try:
+        for item in decision_trace.get("rule_hits", []):
+            if item.get("passed"):
+                reasons.append(str(item.get("rule_id")))
+    except Exception:
+        pass
+    try:
+        extra = decision_trace.get("routing_reasons", [])
+        for rid in extra:
+            if rid not in reasons:
+                reasons.append(str(rid))
+    except Exception:
+        pass
+    return reasons
+
+
+def _build_resolved_params(
+    stage_a_out,
+    cand_cfg: PipelineConfig,
+    *,
+    stage_b_out=None,
+    decision_trace: Optional[Dict[str, Any]] = None,
+    timeline_source: str = "unknown",
+    frame_hop_seconds: float = 0.0,
+    frame_hop_source: str = "unknown",
+    cand_score: float = 0.0,
+    cand_metrics: Optional[Dict[str, Any]] = None,
+    candidate_id: str = "",
+    quality_gate_cfg: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    cand_metrics = cand_metrics or {}
+    quality_gate_cfg = quality_gate_cfg or {}
+    dt = _safe_trace(decision_trace)
+    time_grid = getattr(stage_b_out, "time_grid", None)
+
+    allowed_timeline_sources = {
+        "stage_b_timeline",
+        "stems",
+        "synth_from_time_grid",
+        "e2e_notes",
+        "unknown",
+    }
+
+    tb_source = frame_hop_source
+    hop_sec = float(frame_hop_seconds or 0.0)
+    if time_grid is not None and len(time_grid) >= 2:
+        hop_sec = float(np.median(np.diff(time_grid)))
+        tb_source = "stage_b_time_grid"
+    elif hop_sec <= 0.0:
+        try:
+            sr = float(stage_a_out.meta.sample_rate)
+            hop = float(stage_a_out.meta.hop_length)
+            hop_sec = hop / max(sr, 1e-9)
+            tb_source = "stage_a_meta"
+        except Exception:
+            hop_sec = 0.0
+
+    stage_a_conf = getattr(cand_cfg, "stage_a", None)
+    stage_b_conf = getattr(cand_cfg, "stage_b", None)
+    stage_c_conf = getattr(cand_cfg, "stage_c", None)
+
+    timeline_source_valid = str(timeline_source) if str(timeline_source) in allowed_timeline_sources else "unknown"
+
+    sources = {
+        "stage_b.transcription_mode": "config",
+        "stage_b.separation.enabled": "config",
+        "stage_c.segmentation_method": "config",
+        "stage_c.confidence_threshold": "config",
+    }
+
+    return {
+        "param_snapshot_version": 1,
+        "timebase": {
+            "sample_rate": float(getattr(stage_a_out.meta, "sample_rate", 0.0) or 0.0),
+            "hop_length": float(getattr(stage_a_out.meta, "hop_length", 0.0) or 0.0),
+            "window_size": float(getattr(stage_a_out.meta, "window_size", 0.0) or 0.0),
+            "frame_hop_seconds": hop_sec,
+            "frame_hop_seconds_source": tb_source,
+            "timeline_source": timeline_source_valid,
+            "time_grid_available": bool(time_grid is not None and len(time_grid) > 0),
+        },
+        "preprocessing": {
+            "target_sample_rate": getattr(stage_a_conf, "target_sample_rate", None),
+            "channel_handling": getattr(stage_a_conf, "channel_handling", None),
+            "silence_trimming": getattr(stage_a_conf, "silence_trimming", None),
+            "loudness_normalization": getattr(stage_a_conf, "loudness_normalization", None),
+            "high_pass_filter": getattr(stage_a_conf, "high_pass_filter", None),
+            "peak_limiter": getattr(stage_a_conf, "peak_limiter", None),
+            "separation": getattr(stage_b_conf, "separation", None),
+        },
+        "detectors": {
+            "confidence_voicing_threshold": getattr(stage_b_conf, "confidence_voicing_threshold", None) if stage_b_conf else None,
+            "confidence_priority_floor": getattr(stage_b_conf, "confidence_priority_floor", None) if stage_b_conf else None,
+            "ensemble_weights": dict(getattr(stage_b_conf, "ensemble_weights", {}) or {}),
+            "detectors": dict(getattr(stage_b_conf, "detectors", {}) or {}),
+            "smoothing_method": getattr(stage_b_conf, "smoothing_method", None) if stage_b_conf else None,
+            "viterbi": {
+                "transition_smoothness": getattr(stage_b_conf, "viterbi_transition_smoothness", None) if stage_b_conf else None,
+                "jump_penalty": getattr(stage_b_conf, "viterbi_jump_penalty", None) if stage_b_conf else None,
+            },
+        },
+        "segmentation": {
+            "method": _safe_trace(getattr(stage_c_conf, "segmentation_method", {})).get("method", None) if stage_c_conf else None,
+            "min_note_duration_ms": getattr(stage_c_conf, "min_note_duration_ms", None) if stage_c_conf else None,
+            "min_note_duration_ms_poly": getattr(stage_c_conf, "min_note_duration_ms_poly", None) if stage_c_conf else None,
+            "gap_tolerance_s": getattr(stage_c_conf, "gap_tolerance_s", None) if stage_c_conf else None,
+            "confidence_threshold": getattr(stage_c_conf, "confidence_threshold", None) if stage_c_conf else None,
+            "confidence_hysteresis": getattr(stage_c_conf, "confidence_hysteresis", None) if stage_c_conf else None,
+        },
+        "post_processing": {
+            "chord_onset_snap_ms": getattr(stage_c_conf, "chord_onset_snap_ms", None) if stage_c_conf else None,
+            "post_merge": getattr(stage_c_conf, "post_merge", None) if stage_c_conf else None,
+            "gap_filling": getattr(stage_c_conf, "gap_filling", None) if stage_c_conf else None,
+        },
+        "scoring_routing": {
+            "candidate_id": str(candidate_id),
+            "quality_score": float(cand_score),
+            "quality_metrics": dict(cand_metrics),
+            "quality_gate_threshold": float(quality_gate_cfg.get("threshold", 0.0)),
+            "quality_gate_enabled": bool(quality_gate_cfg.get("enabled", True)),
+            "routing_reasons": _extract_routing_reasons(dt),
+            "decision_trace": dt,
+        },
+        "sources": sources,
+    }
+
+
 def transcribe(
     audio_path: str,
     config: Optional[PipelineConfig] = None,
@@ -231,6 +360,7 @@ def transcribe(
         cand_metrics: Dict[str, Any] = {}
         cand_analysis: Optional[AnalysisData] = None
         cand_trace: Dict[str, Any] = {}
+        stage_b_out = None
 
         try:
             cand_cfg = copy.deepcopy(config)
@@ -274,8 +404,29 @@ def transcribe(
                     notes=list(notes),
                     notes_before_quantization=list(notes),
                     chords=[],
-                    diagnostics={"decision_trace": cand_trace},
+                    diagnostics={
+                        "decision_trace": cand_trace,
+                        "timeline_source": "e2e_notes",
+                        "frame_hop_seconds_source": "meta",
+                        "frame_hop_seconds": float(getattr(stage_a_out.meta, "hop_length", 512)) / float(getattr(stage_a_out.meta, "sample_rate", 44100)),
+                    },
                 )
+                try:
+                    cand_analysis.diagnostics["resolved_params"] = _build_resolved_params(
+                        stage_a_out,
+                        cand_cfg,
+                        stage_b_out=None,
+                        decision_trace=cand_trace,
+                        timeline_source="e2e_notes",
+                        frame_hop_seconds=float(cand_analysis.diagnostics["frame_hop_seconds"]),
+                        frame_hop_source="meta",
+                        cand_score=0.0,
+                        cand_metrics={},
+                        candidate_id=cand_id,
+                        quality_gate_cfg=qcfg,
+                    )
+                except Exception:
+                    pass
 
             else:
                 # Classic + BasicPitch go through Stage B -> Stage C
@@ -368,6 +519,23 @@ def transcribe(
                 if timeline_synth_diag:
                     cand_analysis.diagnostics["timeline_synth"] = timeline_synth_diag
                 cand_analysis.diagnostics["frame_hop_seconds_source"] = frame_hop_source
+                try:
+                    pre_resolved = _build_resolved_params(
+                        stage_a_out,
+                        cand_cfg,
+                        stage_b_out=stage_b_out,
+                        decision_trace=cand_trace,
+                        timeline_source=cand_analysis.diagnostics.get("timeline_source", "unknown"),
+                        frame_hop_seconds=float(getattr(cand_analysis, "frame_hop_seconds", 0.0) or 0.0),
+                        frame_hop_source=cand_analysis.diagnostics.get("frame_hop_seconds_source", "unknown"),
+                        cand_score=0.0,
+                        cand_metrics={},
+                        candidate_id=cand_id,
+                        quality_gate_cfg=qcfg,
+                    )
+                    cand_analysis.diagnostics["resolved_params"] = pre_resolved
+                except Exception:
+                    pass
 
                 # Stage C — IMPORTANT: capture returned notes
                 notes_pred = apply_theory(cand_analysis, cand_cfg)
@@ -398,11 +566,38 @@ def transcribe(
             cand_metrics = _quality_metrics(notes_raw, duration_sec, timeline_source=timeline_src)
             cand_score = _quality_score(cand_metrics)
 
+            try:
+                resolved_params = _build_resolved_params(
+                    stage_a_out,
+                    cand_cfg,
+                    stage_b_out=stage_b_out,
+                    decision_trace=cand_trace,
+                    timeline_source=cand_analysis.diagnostics.get("timeline_source", "unknown") if hasattr(cand_analysis, "diagnostics") else "unknown",
+                    frame_hop_seconds=float(getattr(cand_analysis, "frame_hop_seconds", 0.0) or 0.0),
+                    frame_hop_source=cand_analysis.diagnostics.get("frame_hop_seconds_source", "unknown") if hasattr(cand_analysis, "diagnostics") else "unknown",
+                    cand_score=cand_score,
+                    cand_metrics=cand_metrics,
+                    candidate_id=cand_id,
+                    quality_gate_cfg=qcfg,
+                )
+                if hasattr(cand_analysis, "diagnostics"):
+                    cand_analysis.diagnostics = cand_analysis.diagnostics or {}
+                    cand_analysis.diagnostics["resolved_params"] = resolved_params
+                    cand_analysis.diagnostics.setdefault("routing_reasons", _extract_routing_reasons(cand_trace))
+                    if stage_b_out is not None and getattr(stage_b_out, "diagnostics", None) is not None:
+                        stage_b_out.diagnostics["resolved_params"] = resolved_params
+            except Exception:
+                pass
+
+            high_density = cand_metrics.get("notes_per_sec", 0.0) is not None and float(cand_metrics.get("notes_per_sec", 0.0)) > 12.0
             accepted = (not q_enabled) or (
-                int(cand_metrics.get("note_count", 0)) > 0 and cand_score >= q_threshold
+                int(cand_metrics.get("note_count", 0)) > 0 and cand_score >= q_threshold and (not high_density)
             )
             cand_decision = "accepted" if accepted else "rejected"
-            cand_reason = "ok" if accepted else "below_threshold"
+            if high_density:
+                cand_reason = "note_density_high"
+            else:
+                cand_reason = "ok" if accepted else "below_threshold"
 
             if best is None or cand_score > best[1]:
                 best = (cand_id, cand_score, cand_analysis, cand_cfg)
@@ -468,7 +663,44 @@ def transcribe(
         "candidates": list(candidates),
         "selected_candidate_id": str(selected_id),
         "fallbacks_triggered": list(fallbacks_triggered),
+        "threshold_config": {"threshold": float(q_threshold)},
+        "metrics_measured": {c["candidate_id"]: c.get("metrics", {}) for c in candidates if "candidate_id" in c},
+        "decision_reason_codes": fallbacks_triggered,
+        "invariants_failed": bool(analysis_data.diagnostics.get("health_flags") and "invariants_failed" in analysis_data.diagnostics.get("health_flags", [])),
     }
+    # Invariants and sanity checks
+    invariants = []
+    tb = analysis_data.diagnostics.get("resolved_params", {}).get("timebase", {}) if analysis_data.diagnostics else {}
+    time_grid_present = tb.get("time_grid_available", False)
+    hop_source = tb.get("frame_hop_seconds_source", "")
+    if time_grid_present and hop_source != "stage_b_time_grid":
+        invariants.append({"id": "inv_timegrid_precedence", "ok": False, "details": hop_source})
+    if tb.get("timeline_source", "unknown") == "unknown":
+        invariants.append({"id": "inv_timeline_enum", "ok": False, "details": "unknown_timeline_source"})
+    analysis_data.diagnostics["invariants"] = invariants
+    invariants_failed = any(not inv.get("ok", True) for inv in invariants)
+
+    # Routing sanity checks / health flags
+    health_flags = analysis_data.diagnostics.get("health_flags", [])
+    routing_features = analysis_data.diagnostics.get("decision_trace", {}).get("routing_features", {}) if analysis_data.diagnostics else {}
+    poly_mean = routing_features.get("polyphony_mean", 0.0) or 0.0
+    resolved_mode = analysis_data.diagnostics.get("decision_trace", {}).get("resolved", {}).get("transcription_mode", "")
+    if poly_mean >= 2.5 and resolved_mode == "classic_melody":
+        health_flags.append("routing_poly_mismatch")
+    try:
+        selected_metrics = next((c["metrics"] for c in candidates if c.get("candidate_id") == selected_id), {})
+    except Exception:
+        selected_metrics = {}
+    if selected_metrics:
+        if selected_metrics.get("voiced_ratio", 1.0) is not None and selected_metrics.get("voiced_ratio", 1.0) < 0.25:
+            health_flags.append("voiced_ratio_low")
+        if selected_metrics.get("fragmentation_lt_80ms", 0.0) is not None and selected_metrics.get("fragmentation_lt_80ms", 0.0) > 0.55:
+            health_flags.append("fragmentation_high")
+        if selected_metrics.get("notes_per_sec", 0.0) is not None and selected_metrics.get("notes_per_sec", 0.0) > 12.0:
+            health_flags.append("note_density_high")
+    if invariants_failed:
+        health_flags.append("invariants_failed")
+    analysis_data.diagnostics["health_flags"] = health_flags
 
     if requested_quality_mode:
         analysis_data.diagnostics["requested_quality_mode"] = requested_quality_mode
