@@ -11,17 +11,36 @@ from backend.transcription import transcribe_audio_pipeline, transcribe_audio
 
 app = FastAPI()
 
+# Helper parsers
+def parse_bool_env(value: str | None, default: bool = False) -> bool:
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 # Allow CORS for frontend
+allowed_origins_env = os.getenv("MNC_ALLOWED_ORIGINS")
+allowed_origins = (
+    [origin.strip() for origin in allowed_origins_env.split(",") if origin.strip()]
+    if allowed_origins_env
+    else ["http://localhost:5173"]
+)
+allow_credentials = parse_bool_env(os.getenv("MNC_ALLOW_CREDENTIALS"), False)
+
+# Browsers block wildcard origins when allow_credentials=True, so disable credentials in that case
+if "*" in allowed_origins and allow_credentials:
+    allow_credentials = False
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # you can restrict this to your frontend origin
-    allow_credentials=True,
+    allow_origins=allowed_origins,
+    allow_credentials=allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # Optional: mock mode via env variable
-USE_MOCK = bool(int(os.getenv("MNC_USE_MOCK", "0")))
+USE_MOCK = parse_bool_env(os.getenv("MNC_USE_MOCK"), False)
 
 
 @app.post("/api/transcribe")

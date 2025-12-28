@@ -176,9 +176,11 @@ export const TranscriptionService = {
     // (Bypassing backend to ensure we have the NoteEvent objects needed for the sequencer)
     console.log("Using local transcription engine...");
     
+    let ctx: AudioContext | null = null;
+
     try {
         // Use a fresh context for decoding to avoid state issues
-        const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
+        ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
         const arrayBuffer = await audioBlob.arrayBuffer();
         const audioBuffer = await ctx.decodeAudioData(arrayBuffer);
         
@@ -200,6 +202,14 @@ export const TranscriptionService = {
             notes: [],
             chords: []
         };
+    } finally {
+        if (ctx) {
+            try {
+                ctx.close();
+            } catch (closeError) {
+                console.warn("Failed to close AudioContext", closeError);
+            }
+        }
     }
   }
 };

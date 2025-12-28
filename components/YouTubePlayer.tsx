@@ -82,8 +82,9 @@ const YouTubePlayer: React.FC<YouTubePlayerProps> = ({
       if (timeIntervalRef.current) clearInterval(timeIntervalRef.current);
       if (playerRef.current && playerRef.current.destroy) {
           try {
-             // playerRef.current.destroy(); // Keeping instance often better for React
+             playerRef.current.destroy();
           } catch(e) {}
+          playerRef.current = null;
       }
     };
   }, []);

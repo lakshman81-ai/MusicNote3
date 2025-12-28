@@ -109,16 +109,25 @@ const SheetMusic: React.FC<SheetMusicProps> = ({
                   // Reset if we jumped back (naive)
                   if (currentTime < 0.2) cursor.reset();
                   
-                  // Helper: Convert OSMD timestamp to seconds
-                  // OSMD uses "Measures". We need "RealValue" which is beats (usually quarter notes).
-                  const iteratorTime = cursor.iterator.currentTimeStamp.RealValue * 4; // MusicXML Measures to Beats (assuming 4/4)
+                  let iteratorTime = cursor.iterator.currentTimeStamp.RealValue * 4; // MusicXML Measures to Beats (assuming 4/4)
+                  let previousIteratorTime = iteratorTime;
                   
                   // If our visual cursor is behind real time, advance it
                   // We limit loop to avoid freezing
                   let steps = 0;
                   while (iteratorTime < currentBeat && !cursor.iterator.endReached && steps < 50) {
                       cursor.next();
+                      iteratorTime = cursor.iterator.currentTimeStamp.RealValue * 4;
                       steps++;
+
+                      if (iteratorTime <= previousIteratorTime) {
+                          break; // Guard against stalled iterator timestamps
+                      }
+                      previousIteratorTime = iteratorTime;
+
+                      if (iteratorTime > currentBeat) {
+                          break;
+                      }
                   }
               }
           } catch(e) {
