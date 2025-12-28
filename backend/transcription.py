@@ -4,6 +4,7 @@ import music21
 import tempfile
 import os
 import shutil
+import copy
 import librosa
 import numpy as np
 
@@ -215,19 +216,30 @@ def transcribe_audio_pipeline(
         beats=beats # Add beats
     )
 
-    # Store pre-quantization notes
-    from dataclasses import replace
-    analysis_data.notes_before_quantization = [replace(n) for n in notes]
-
     # 4. Stage C: Apply Theory
     events_with_theory = apply_theory(analysis_data, config=pipeline_conf)
+    events_for_copy = list(events_with_theory or [])
     validate_invariants(events_with_theory, pipeline_conf, analysis_data=analysis_data)
+
+    # Preserve a deep copy of notes before quantization to avoid Stage D mutation
+    if not getattr(analysis_data, "notes_before_quantization", None):
+        analysis_data.notes_before_quantization = copy.deepcopy(events_for_copy)
+    else:
+        analysis_data.notes_before_quantization = copy.deepcopy(list(analysis_data.notes_before_quantization))
+
+    # Record diagnostic source for scoring
+    try:
+        analysis_data.diagnostics = getattr(analysis_data, "diagnostics", {}) or {}
+        analysis_data.diagnostics["scored_notes_source"] = "pre_quantization"
+    except Exception:
+        pass
 
     # 5. Stage D: Quantize and Render
     midi_bytes = b""
     try:
+        render_notes = copy.deepcopy(events_for_copy)
         stage_d_result = quantize_and_render(
-            events_with_theory,
+            render_notes,
             analysis_data,
             config=pipeline_conf,
         )
