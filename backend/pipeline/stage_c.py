@@ -975,6 +975,20 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
         None,
     )
     hop_hint = float(hop_hint) if hop_hint else None
+    if not hop_hint:
+        try:
+            hop_hint = float(getattr(analysis_data, "frame_hop_seconds", 0.0) or 0.0)
+        except Exception:
+            hop_hint = None
+
+    if hop_hint:
+        hop_source_hint = _get(
+            analysis_data.diagnostics,
+            "resolved_params.timebase.frame_hop_seconds_source",
+            _get(analysis_data.diagnostics, "frame_hop_seconds_source", "config"),
+        )
+        analysis_data.diagnostics.setdefault("frame_hop_seconds_source", hop_source_hint)
+        analysis_data.diagnostics["frame_hop_seconds"] = hop_hint
 
     seg_method = str(seg_cfg.get("method") or _get(config, "stage_c.segmentation_method", "threshold")).lower()
     smoothing_enabled = bool(seg_cfg.get("use_state_smoothing", _get(config, "stage_c.use_state_smoothing", False)))
@@ -1125,6 +1139,9 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
             )
 
             hop_s = hop_hint if hop_hint else _estimate_hop_seconds(timeline)
+            if not hop_hint:
+                analysis_data.diagnostics["frame_hop_seconds_source"] = "heuristic"
+                analysis_data.diagnostics["frame_hop_seconds"] = hop_s
 
             for sub_idx, sub_tl in enumerate(voice_timelines):
                 if not any(fp.pitch_hz > 0 for fp in sub_tl):
