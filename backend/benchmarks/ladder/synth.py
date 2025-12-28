@@ -93,14 +93,23 @@ def midi_to_wav_synth(score_stream: stream.Score, wav_path: str, sr: int = 22050
     def _waveform(freq, t, amp):
         if not use_enhanced_synth:
             return amp * np.sin(2 * np.pi * freq * t)
+
+        # Lead (approx. 400Hz - 1200Hz): FM + vibrato
+        if freq > 350.0:
+            vib = 0.003 * np.sin(2 * np.pi * 5.5 * t)
+            return amp * (0.7 * np.sin(2 * np.pi * freq * (1 + vib) * t) +
+                          0.3 * np.sin(2 * np.pi * 2 * freq * (1 + vib) * t))
+
+        # Bass (approx. < 200Hz): Saw-ish (odd harmonics)
         if freq < 200.0:
-            # Richer bass content (saw-like)
-            return amp * 0.5 * (2.0 * (t * freq - np.floor(t * freq + 0.5)))
-        elif freq < 500.0:
-            # Slightly brighter (square-ish)
-            return amp * np.sign(np.sin(2 * np.pi * freq * t))
-        else:
-            return amp * np.sin(2 * np.pi * freq * t)
+            return amp * (np.sin(2 * np.pi * freq * t) +
+                          (1/3) * np.sin(2 * np.pi * 3 * freq * t) +
+                          (1/5) * np.sin(2 * np.pi * 5 * freq * t))
+
+        # Chords/Pad (Mid range): Sine stack
+        return amp * (np.sin(2 * np.pi * freq * t) +
+                      0.5 * np.sin(2 * np.pi * 2 * freq * t) +
+                      0.25 * np.sin(2 * np.pi * 3 * freq * t))
 
     # Synthesize
     for start, dur, freq, vel in events:
@@ -120,9 +129,42 @@ def midi_to_wav_synth(score_stream: stream.Score, wav_path: str, sr: int = 22050
 
         wave = _waveform(freq, t, amp)
 
-        # Simple envelope
-        attack_s = 0.05 if (use_enhanced_synth and freq < 200.0) else 0.02
-        release_s = 0.08 if (use_enhanced_synth and freq < 200.0) else 0.05
+        # Envelopes per type (heuristic based on freq)
+        if use_enhanced_synth:
+            if freq > 350.0: # Lead: ADSR
+                a, d, s, r = 0.01, 0.08, 0.6, 0.12
+            elif freq < 200.0: # Bass: fast attack
+                a, d, s, r = 0.01, 0.1, 0.8, 0.1
+            else: # Chords: softer
+                a, d, s, r = 0.05, 0.1, 0.7, 0.15
+
+            env = np.ones_like(t)
+            # Attack
+            attack_mask = t < a
+            if np.any(attack_mask):
+                env[attack_mask] = t[attack_mask] / max(a, 1e-6)
+
+            # Decay/Sustain
+            decay_mask = (t >= a) & (t < a + d)
+            if np.any(decay_mask):
+                env[decay_mask] = 1.0 - (1.0 - s) * ((t[decay_mask] - a) / max(d, 1e-6))
+
+            # Release (approximated at note end)
+            release_n = int(r * sr)
+            if length > release_n:
+                 env[-release_n:] *= np.linspace(1, 0, release_n)
+
+            wave *= env
+        else:
+            # Simple envelope
+            attack_s = 0.02
+            release_s = 0.05
+            attack_n = int(attack_s * sr)
+            release_n = int(release_s * sr)
+            if length > attack_n:
+                wave[:attack_n] *= np.linspace(0, 1, attack_n)
+            if length > release_n:
+                wave[-release_n:] *= np.linspace(1, 0, release_n)
         attack_n = int(attack_s * sr)
         release_n = int(release_s * sr)
 

@@ -9,6 +9,7 @@ import numpy as np
 
 from .config import PipelineConfig
 from .instrumentation import PipelineLogger
+from .utils_config import safe_getattr, safe_setattr
 from .models import AnalysisData, NoteEvent, TranscriptionResult, FramePitch
 from .stage_a import load_and_preprocess
 from .stage_b import compute_decision_trace, extract_features
@@ -347,14 +348,16 @@ def transcribe(
     meta_processing_mode_preserved = False
     meta_processing_mode_val = None
 
+    # capture once (before candidate loop / before quality pipeline mutates meta)
+    try:
+        meta_processing_mode_val = safe_getattr(getattr(stage_a_out, "meta", None), "processing_mode", None)
+    except Exception:
+        meta_processing_mode_val = None
+
     if requested_mode in ("quality", "fast"):
         requested_quality_mode = requested_mode
         # Ensure we don't clobber meta.processing_mode
         meta_processing_mode_preserved = True
-        try:
-            meta_processing_mode_val = stage_a_out.meta.processing_mode
-        except Exception:
-            pass
 
     meta_profile = str(getattr(getattr(stage_a_out, "meta", None), "instrument", None) or "unknown")
     req_profile = str(requested_profile) if requested_profile is not None else meta_profile
@@ -560,10 +563,7 @@ def transcribe(
 
                 # Restore processing_mode if needed (B1 fix)
                 if requested_quality_mode and meta_processing_mode_val is not None:
-                    try:
-                        cand_analysis.meta.processing_mode = meta_processing_mode_val
-                    except Exception:
-                        pass
+                    safe_setattr(getattr(cand_analysis, "meta", None), "processing_mode", meta_processing_mode_val)
 
                 cand_analysis.diagnostics = cand_analysis.diagnostics or {}
                 cand_analysis.diagnostics["timeline_source"] = timeline_source

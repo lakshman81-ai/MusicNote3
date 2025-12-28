@@ -26,6 +26,8 @@ import numpy as np
 import math
 import logging
 
+from .utils_config import coalesce_not_none
+
 logger = logging.getLogger(__name__)
 
 # Support both package and top-level imports for models
@@ -1286,11 +1288,13 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
     # Stage C Post-processing (poly stability)
     # ---------------------------------------------------------------------
     snap_ms = float(_get(config, "stage_c.chord_onset_snap_ms", 25.0))
-    merge_gap_ms = float(
-        _get(config, "stage_c.post_merge.max_gap_ms", None)
-        or _get(config, "stage_c.gap_filling.max_gap_ms", None)
-        or 60.0
+    merge_gap_ms = coalesce_not_none(
+        _get(config, "stage_c.post_merge.max_gap_ms", None),
+        _get(config, "stage_c.gap_filling.max_gap_ms", None),
+        100.0,
     )
+    merge_gap_ms = float(merge_gap_ms)
+
     merge_gap_ms = float(min(max(merge_gap_ms, 0.0), 200.0))
     if poly_profile_active:
         merge_gap_ms = float(min(max(merge_gap_ms, poly_gap_merge_floor_ms), poly_gap_merge_max_ms))

@@ -46,6 +46,7 @@ SCIPY_SIGNAL = None
 if importlib.util.find_spec("scipy.signal"):
     import scipy.signal as SCIPY_SIGNAL
 
+_PSEUDO_DETECTOR_KEYS = {"fmin_override", "fmax_override"}
 
 def _get(cfg: Any, path: str, default: Any = None) -> Any:
     cur = cfg
@@ -993,6 +994,12 @@ def _resolve_separation(
         "duration_sec": float(duration_sec),
     }
 
+    model_name = str(
+        sep_conf.get("model")
+        or sep_conf.get("model_name")
+        or "htdemucs"
+    )
+
     try:
         raw_stems = {}
         if use_synth:
@@ -1005,7 +1012,7 @@ def _resolve_separation(
             raw_stems = _run_htdemucs(
                 np.asarray(mix_audio, dtype=np.float32),
                 mix_stem.sr,
-                str(sep_conf.get("model_name", "htdemucs")),
+                model_name,
                 overlap,
                 shifts,
                 device,
@@ -1067,7 +1074,7 @@ def _resolve_separation(
                 "bypass_if_synthetic_like": bool(bypass_if_synth),
             },
             "outputs": {"stems": stem_names, "selected_primary_stem": str(selected)},
-            "mode": "synthetic_mdx" if use_synth else sep_conf.get("model_name", "htdemucs"),
+            "mode": "synthetic_mdx" if use_synth else model_name,
             "synthetic_ran": bool(use_synth),
             "htdemucs_ran": not bool(use_synth),
             "fallback": False,
@@ -1182,6 +1189,12 @@ def _init_detector(name: str, conf: Dict[str, Any], sr: int, hop_length: int) ->
     kwargs = {k: v for k, v in conf.items() if k not in ("enabled", "hop_length")}
     kwargs.setdefault("fmin", 60.0)
     kwargs.setdefault("fmax", 2200.0)
+
+    if name == "crepe":
+        if "conf_threshold" not in kwargs and "confidence_threshold" in kwargs:
+            kwargs["conf_threshold"] = kwargs["confidence_threshold"]
+        if "confidence_threshold" not in kwargs and "conf_threshold" in kwargs:
+            kwargs["confidence_threshold"] = kwargs["conf_threshold"]
 
     try:
         if name == "swiftf0":
@@ -1629,7 +1642,28 @@ def extract_features(
     weights_eff = dict(b_conf.ensemble_weights)
     melody_filter_eff = dict(getattr(b_conf, "melody_filtering", {}) or {})
 
-    enabled_dets = {k for k, v in detector_cfgs.items() if v.get("enabled", False)}
+    # Runner-scoped global overrides (optional)
+    fmin_override = None
+    try:
+        raw = detector_cfgs.get("fmin_override", None)
+        if raw is not None:
+            fmin_override = float(raw)
+    except Exception:
+        fmin_override = None
+
+    if fmin_override is not None and fmin_override > 0.0:
+        for det_name, dconf in detector_cfgs.items():
+            if det_name in _PSEUDO_DETECTOR_KEYS or not isinstance(dconf, dict):
+                continue
+            if dconf.get("enabled", False):
+                cur = float(dconf.get("fmin", 0.0) or 0.0)
+                dconf["fmin"] = max(cur, fmin_override)
+
+        # keep filters consistent with detector floor
+        cur_fmin_f = float(melody_filter_eff.get("fmin_hz", 0.0) or 0.0)
+        melody_filter_eff["fmin_hz"] = max(cur_fmin_f, fmin_override)
+
+    enabled_dets = {k for k, v in detector_cfgs.items() if isinstance(v, dict) and v.get("enabled", False)}
     weights_eff = {k: v for k, v in weights_eff.items() if k in enabled_dets}
 
     common_keys = {"enabled", "fmin", "fmax", "hop_length", "frame_length", "threshold"}
@@ -1646,7 +1680,9 @@ def extract_features(
             detector_cfgs[det_name].update(overrides)
 
     if profile:
-        for _, dconf in detector_cfgs.items():
+        for det_name, dconf in detector_cfgs.items():
+            if det_name in _PSEUDO_DETECTOR_KEYS or not isinstance(dconf, dict):
+                continue
             dconf.setdefault("fmin", float(profile.fmin))
             dconf.setdefault("fmax", float(profile.fmax))
             dconf["fmin"] = float(profile.fmin)
@@ -1718,6 +1754,8 @@ def extract_features(
 
     detectors: Dict[str, BasePitchDetector] = {}
     for name, det_conf in detector_cfgs.items():
+        if name in _PSEUDO_DETECTOR_KEYS or not isinstance(det_conf, dict):
+            continue
         det = _init_detector(name, det_conf, sr, hop_length)
         if det:
             detectors[name] = det
