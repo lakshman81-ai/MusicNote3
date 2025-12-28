@@ -679,6 +679,105 @@ def _snap_chord_starts_with_count(notes: List[NoteEvent], tol_ms: float = 25.0) 
     return out, moved
 
 
+def _merge_notes_across_layers(
+    notes: List[NoteEvent],
+    pitch_tolerance_cents: float = 50.0,
+    snap_onset_ms: float = 25.0,
+    max_gap_ms: float = 100.0,
+) -> List[NoteEvent]:
+    """
+    Merge notes from multiple layers.
+    1. Sort by start time.
+    2. Snap nearby onsets.
+    3. Merge fuzzy-pitch overlapping/gapped notes.
+    """
+    if not notes:
+        return []
+
+    # Snap onsets first
+    if snap_onset_ms > 0:
+        notes, _ = _snap_chord_starts_with_count(notes, tol_ms=snap_onset_ms)
+
+    notes = sorted(notes, key=lambda n: (float(n.start_sec), -float(n.end_sec), -float(getattr(n, "confidence", 0.0))))
+    out: List[NoteEvent] = []
+    merged_indices = set()
+
+    for i in range(len(notes)):
+        if i in merged_indices:
+            continue
+
+        current = notes[i]
+
+        # Look ahead for merge candidates
+        # A note is a candidate if:
+        # - Starts before current ends + gap
+        # - Pitch is within tolerance
+
+        active_chain = [current]
+
+        # Extending the current note "cluster"
+        # This is a simple greedy merge.
+        # We search forward.
+
+        candidates_to_check = list(range(i + 1, len(notes)))
+
+        # Limit search window to avoid O(N^2) on huge files?
+        # Notes are sorted by start time.
+        # If start time is > current.end + gap, we can stop?
+        # But we need to update current.end as we merge.
+
+        j = i + 1
+        while j < len(notes):
+            if j in merged_indices:
+                j += 1
+                continue
+
+            candidate = notes[j]
+            gap = float(candidate.start_sec) - float(current.end_sec)
+
+            if gap > (max_gap_ms / 1000.0):
+                # Optimization: if gap is huge, and notes sorted by start,
+                # candidates further down won't be mergeable unless they are huge overlaps?
+                # But sorted by start_sec.
+                # If candidate.start > current.end + gap, then any subsequent candidate will also be > current.end + gap
+                # because subsequent.start >= candidate.start.
+                break
+
+            # Check overlap or gap match
+            # Overlap: candidate.start < current.end
+            # Gap: candidate.start > current.end (but < gap limit)
+
+            # Check pitch
+            p1 = float(current.pitch_hz)
+            p2 = float(candidate.pitch_hz)
+            if p1 <= 0 or p2 <= 0:
+                j += 1
+                continue
+
+            cents_diff = abs(1200.0 * math.log2(p2 / p1))
+            if cents_diff <= pitch_tolerance_cents:
+                # Merge!
+                # Update current to cover candidate
+                current.end_sec = max(float(current.end_sec), float(candidate.end_sec))
+                current.confidence = max(float(current.confidence or 0), float(candidate.confidence or 0))
+                # Average pitch? or Keep dominant?
+                # Keep dominant (highest confidence or longest).
+                # Current logic: first one wins pitch unless we explicitly avg.
+                # Let's weighted avg pitch? No, keep it simple: longest/strongest.
+                # Here we just keep 'current's pitch but extend duration.
+
+                merged_indices.add(j)
+
+                # If we extended end_sec, we might overlap more notes now.
+                # The loop continues.
+
+            j += 1
+
+        out.append(current)
+
+    return out
+
+
 def _merge_same_pitch_gaps(
     notes: List[NoteEvent],
     max_gap_ms: float = 60.0,
@@ -1287,13 +1386,13 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
     # ---------------------------------------------------------------------
     # Stage C Post-processing (poly stability)
     # ---------------------------------------------------------------------
-    snap_ms = float(_get(config, "stage_c.chord_onset_snap_ms", 25.0))
-    merge_gap_ms = coalesce_not_none(
-        _get(config, "stage_c.post_merge.max_gap_ms", None),
-        _get(config, "stage_c.gap_filling.max_gap_ms", None),
-        100.0,
-    )
-    merge_gap_ms = float(merge_gap_ms)
+    # Precedence: post_merge > gap_filling, default 100.0
+    post_merge_gap = _get(config, "stage_c.post_merge.max_gap_ms", None)
+    gap_fill_gap = _get(config, "stage_c.gap_filling.max_gap_ms", None)
+    merge_gap_ms = float(coalesce_not_none(post_merge_gap, gap_fill_gap, 100.0))
+
+    chord_snap_raw = _get(config, "stage_c.chord_onset_snap_ms", None)
+    snap_ms = float(coalesce_not_none(chord_snap_raw, 25.0))
 
     merge_gap_ms = float(min(max(merge_gap_ms, 0.0), 200.0))
     if poly_profile_active:
@@ -1305,6 +1404,15 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
 
     do_poly_post = bool(poly_used) or len(notes) >= 2
     if do_poly_post:
+        # New fuzzy merge if multi-stem/poly context
+        if stage_c_context.get("multi_stem", False) or poly_used:
+             notes = _merge_notes_across_layers(
+                 notes,
+                 pitch_tolerance_cents=poly_pitch_tolerance,
+                 snap_onset_ms=snap_ms,
+                 max_gap_ms=merge_gap_ms
+             )
+
         notes = _dedupe_overlapping_notes(notes)
 
         if merge_gap_ms > 0:

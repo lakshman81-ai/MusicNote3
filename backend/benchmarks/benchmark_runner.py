@@ -802,12 +802,11 @@ class BenchmarkSuite:
 
         return self._apply_suite_determinism(config)
 
-def _force_stage_b_mode(cfg, mode: str) -> None:
-    try:
-        cfg.stage_b.transcription_mode = str(mode)
-    except Exception:
-        pass
-
+    def _force_stage_b_mode(self, cfg, mode: str) -> None:
+        try:
+            cfg.stage_b.transcription_mode = str(mode)
+        except Exception:
+            pass
 
     def _enforce_regression_thresholds(self, level: str, metrics: Dict[str, Any], profiling: Optional[Dict[str, Any]] = None):
         plan = accuracy_benchmark_plan()
@@ -1802,7 +1801,8 @@ def _force_stage_b_mode(cfg, mode: str) -> None:
                 pass
 
         config = self._prepare_l5_config(config, overrides=overrides, override_path=override_path)
-        _force_stage_b_mode(config, "classic_song")
+        self._force_stage_b_mode(config, "classic_song")
+        self._force_stage_b_mode(config, "classic_song")
 
         res = run_pipeline_on_audio(
             audio.astype(np.float32),

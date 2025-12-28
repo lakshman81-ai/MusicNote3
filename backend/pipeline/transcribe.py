@@ -563,7 +563,7 @@ def transcribe(
 
                 # Restore processing_mode if needed (B1 fix)
                 if requested_quality_mode and meta_processing_mode_val is not None:
-                    safe_setattr(getattr(cand_analysis, "meta", None), "processing_mode", meta_processing_mode_val)
+                    safe_setattr(cand_analysis.meta, "processing_mode", meta_processing_mode_val)
 
                 cand_analysis.diagnostics = cand_analysis.diagnostics or {}
                 cand_analysis.diagnostics["timeline_source"] = timeline_source

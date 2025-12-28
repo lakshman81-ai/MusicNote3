@@ -531,24 +531,23 @@ def main() -> int:
     for (gap_ms, snap_ms, thr) in combos:
         cfg = copy.deepcopy(base_cfg)
 
-        # ✅ FIX 2: force L6 mode for every sweep candidate (paranoia)
-        _ = apply_dotted_overrides(cfg, {
+        # ✅ FIX 2: force L6 mode + apply sweep overrides
+        sweep_overrides = {
             "stage_b.transcription_mode": "classic_song",
             "stage_b.separation.enabled": True,
             "stage_b.separation.synthetic_model": True,
-        })
+            "stage_c.post_merge.max_gap_ms": float(gap_ms),
+            "stage_c.gap_filling.max_gap_ms": float(gap_ms),
+            "stage_c.chord_onset_snap_ms": float(snap_ms),
+            "stage_c.confidence_threshold": float(thr),
+        }
+        apply_dotted_overrides(cfg, sweep_overrides)
 
-        # Stage C knobs (both new + legacy paths)
-        _cfg_set_path(cfg, "stage_c.post_merge.max_gap_ms", float(gap_ms))
-        _cfg_set_path(cfg, "stage_c.gap_filling.max_gap_ms", float(gap_ms))  # legacy fallback
-        _cfg_set_path(cfg, "stage_c.chord_onset_snap_ms", float(snap_ms))
-
-        # Sweep segmentation threshold (primary)
+        # Hysteresis adjustment if present
         try:
-            cfg.stage_c.confidence_threshold = float(thr)
             if hasattr(cfg.stage_c, "confidence_hysteresis") and isinstance(cfg.stage_c.confidence_hysteresis, dict):
-                cfg.stage_c.confidence_hysteresis["start"] = float(max(thr, cfg.stage_c.confidence_hysteresis.get("start", thr)))
-                cfg.stage_c.confidence_hysteresis["end"] = float(min(thr, cfg.stage_c.confidence_hysteresis.get("end", thr)))
+                cfg.stage_c.confidence_hysteresis["start"] = float(max(float(thr), cfg.stage_c.confidence_hysteresis.get("start", float(thr))))
+                cfg.stage_c.confidence_hysteresis["end"] = float(min(float(thr), cfg.stage_c.confidence_hysteresis.get("end", float(thr))))
         except Exception:
             pass
 

@@ -22,6 +22,7 @@ from collections import deque
 
 from .models import StageAOutput, FramePitch, AnalysisData, AudioType, StageBOutput, Stem
 from .config import PipelineConfig
+from .utils_config import safe_getattr, coalesce_not_none
 from .detectors import (
     SwiftF0Detector, SACFDetector, YinDetector,
     CQTDetector, RMVPEDetector, CREPEDetector,
@@ -1651,17 +1652,31 @@ def extract_features(
     except Exception:
         fmin_override = None
 
-    if fmin_override is not None and fmin_override > 0.0:
-        for det_name, dconf in detector_cfgs.items():
-            if det_name in _PSEUDO_DETECTOR_KEYS or not isinstance(dconf, dict):
-                continue
-            if dconf.get("enabled", False):
-                cur = float(dconf.get("fmin", 0.0) or 0.0)
-                dconf["fmin"] = max(cur, fmin_override)
+    # Pull overrides if present
+    fmin_override = None
+    fmax_override = None
+    if isinstance(detector_cfgs.get("fmin_override", None), (int, float)):
+        fmin_override = float(detector_cfgs["fmin_override"])
+    if isinstance(detector_cfgs.get("fmax_override", None), (int, float)):
+        fmax_override = float(detector_cfgs["fmax_override"])
 
-        # keep filters consistent with detector floor
-        cur_fmin_f = float(melody_filter_eff.get("fmin_hz", 0.0) or 0.0)
-        melody_filter_eff["fmin_hz"] = max(cur_fmin_f, fmin_override)
+    # remove pseudo-keys so later loops won't treat them as detector dicts
+    for k in list(_PSEUDO_DETECTOR_KEYS):
+        detector_cfgs.pop(k, None)
+
+    # apply override into all enabled detectors + melody_filter
+    if fmin_override is not None:
+        melody_filter_eff["fmin_hz"] = max(float(melody_filter_eff.get("fmin_hz", 0.0) or 0.0), fmin_override)
+        for dname, dconf in detector_cfgs.items():
+            if isinstance(dconf, dict) and dconf.get("enabled", False):
+                dconf["fmin"] = max(float(dconf.get("fmin", 0.0) or 0.0), fmin_override)
+
+    if fmax_override is not None:
+        melody_filter_eff["fmax_hz"] = min(float(melody_filter_eff.get("fmax_hz", 1e9) or 1e9), fmax_override)
+        for dname, dconf in detector_cfgs.items():
+            if isinstance(dconf, dict) and dconf.get("enabled", False):
+                cur = float(dconf.get("fmax", 1e9) or 1e9)
+                dconf["fmax"] = min(cur, fmax_override)
 
     enabled_dets = {k for k, v in detector_cfgs.items() if isinstance(v, dict) and v.get("enabled", False)}
     weights_eff = {k: v for k, v in weights_eff.items() if k in enabled_dets}
@@ -1690,6 +1705,19 @@ def extract_features(
 
         melody_filter_eff["fmin_hz"] = float(profile.fmin)
         melody_filter_eff["fmax_hz"] = float(profile.fmax)
+
+        # CQT Super-res for synthetic-like audio
+        synthetic_like = bool(routing_features.get("synthetic_like", False))
+        cqt_superres = bool(profile_special.get("cqt_superres", False)) or synthetic_like
+
+        if cqt_superres and "cqt" in detector_cfgs:
+            d = detector_cfgs["cqt"]
+            if isinstance(d, dict):
+                d["bins_per_octave"] = int(max(60, d.get("bins_per_octave", 36)))
+                d["fmin"] = float(min(27.5, d.get("fmin", 60.0)))
+                d["fmax"] = float(max(4200.0, d.get("fmax", 2200.0)))
+                if "threshold" in d:
+                    d["threshold"] = float(min(d["threshold"], 0.01))
 
         rec = (profile.recommended_algo or "").lower()
         if rec and rec != "none" and rec in detector_cfgs:
@@ -1914,6 +1942,8 @@ def extract_features(
                         flatness_thresholds=poly_peel.get("flatness_thresholds", [0.3, 0.6]),
                         use_freq_aware_masks=bool(poly_peel.get("use_freq_aware_masks", True)),
                     )
+                    # NOTE: iss_layers contains (f0_l, c_l)
+                    # StageBOutput.f0_layers will store these
                     for f0_l, _c_l in iss_layers:
                         all_layers.append(np.asarray(f0_l, dtype=np.float32))
                     iss_total_layers += len(iss_layers)
@@ -1955,6 +1985,10 @@ def extract_features(
                     pconf2 = np.where(lock_mask, 0.0, pconf)
                     pf02 = np.where(lock_mask, 0.0, pf0)
                     per_detector[stem_name][det_name] = (pf02, pconf2)
+
+        # RMS Gate relaxation for synthetic
+        if bool(routing_features.get("synthetic_like", False)):
+            melody_filter_eff["rms_gate_db"] = float(min(melody_filter_eff.get("rms_gate_db", -40.0), -80.0))
 
         merged_f0, merged_conf = _apply_melody_filters(
             merged_f0,
@@ -2007,6 +2041,13 @@ def extract_features(
         padded_layers = [(_pad_to(f0, max_frames), _pad_to(conf, max_frames)) for f0, conf in layer_arrays]
         padded_rms = _pad_to(rms_vals, max_frames)
 
+        # Export ISS/residual layers as timelines for Stage C
+        for idx, (p_f0, p_conf) in enumerate(padded_layers):
+            if idx == 0:
+                continue
+            layer_tl = _arrays_to_timeline(p_f0, p_conf, padded_rms, sr, hop_length)
+            stem_timelines[f"{stem_name}_layer_{idx}"] = layer_tl
+
         cqt_ctx = None
         cqt_gate_enabled = bool((getattr(b_conf, "polyphonic_peeling", {}) or {}).get("cqt_gate_enabled", True))
         if is_true_poly and polyphonic_context and cqt_gate_enabled:
@@ -2043,12 +2084,17 @@ def extract_features(
         poly_peel2 = getattr(b_conf, "polyphonic_peeling", {}) or {}
         max_cands = int(poly_peel2.get("max_candidates_per_frame", tracker.max_tracks))
 
+        # Relaxed voicing threshold for residual layers
+        base_thr = voicing_thr
+        layer_thr = max(0.05, base_thr * 0.4)
+
         for i in range(max_frames):
             candidates: List[Tuple[float, float]] = []
-            for f0_arr, conf_arr in padded_layers:
+            for layer_idx, (f0_arr, conf_arr) in enumerate(padded_layers):
+                thr = base_thr if layer_idx == 0 else layer_thr
                 f = float(f0_arr[i]) if i < len(f0_arr) else 0.0
                 c = float(conf_arr[i]) if i < len(conf_arr) else 0.0
-                if f > 0.0 and c >= voicing_thr:
+                if f > 0.0 and c >= thr:
                     candidates.append((f, c))
 
             candidates = _postprocess_candidates(
