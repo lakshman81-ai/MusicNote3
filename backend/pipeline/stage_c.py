@@ -834,6 +834,9 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
     elif not isinstance(analysis_data, AnalysisData):
         return []
 
+    if getattr(analysis_data, "diagnostics", None) is None or not isinstance(analysis_data.diagnostics, dict):
+        analysis_data.diagnostics = {}
+
     quantize_enabled = bool(_get(config, "stage_c.quantize.enabled", True))
 
     # Short-circuit if precalculated notes exist (E2E path)
@@ -887,9 +890,42 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
         seg_cfg["pitch_ref_window_frames"] = int(profile_special["stage_c_pitch_ref_window_frames"])
 
     stem_timelines: Dict[str, List[FramePitch]] = analysis_data.stem_timelines or {}
+    stage_c_context: Dict[str, Any] = {}
+    meta_audio_type = getattr(analysis_data.meta, "audio_type", None)
+    meta_audio_type_str = str(getattr(meta_audio_type, "value", meta_audio_type))
+    poly_flag_diag = bool(_get(analysis_data.diagnostics, "polyphonic_context", False))
+    decision_trace_audio = str(_get(analysis_data.diagnostics, "decision_trace.resolved.audio_type", "") or "")
+    poly_flag_decision = "poly" in decision_trace_audio.lower()
+
+    poly_context = bool(
+        meta_audio_type in (
+            getattr(AudioType, "POLYPHONIC", None),
+            getattr(AudioType, "POLYPHONIC_DOMINANT", None),
+        )
+        or poly_flag_diag
+        or poly_flag_decision
+        or len(stem_timelines) > 1
+    )
+
+    stage_c_context = {
+        "meta_audio_type": meta_audio_type_str,
+        "polyphonic_context_flag": bool(poly_flag_diag),
+        "decision_trace_audio_type": decision_trace_audio,
+        "multi_stem": len(stem_timelines) > 1,
+        "polyphonic_context_resolved": bool(poly_context),
+    }
+
     if not stem_timelines:
         analysis_data.notes_before_quantization = []
         analysis_data.notes = []
+        analysis_data.diagnostics["stage_c"] = {
+            "segmentation_method": _get(config, "stage_c.segmentation_method.method", "threshold"),
+            "timelines_processed": 0,
+            "note_count_raw": 0,
+            "selected_stem": None,
+            "quantize_enabled": quantize_enabled,
+            "polyphonic_context": stage_c_context,
+        }
         return []
 
     stem_name, primary_timeline = _select_best_stem_timeline(stem_timelines, config)
@@ -907,6 +943,7 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
     min_note_dur_s = float(min_note_dur_ms) / 1000.0
 
     min_note_dur_ms_poly = resolve_val("min_note_duration_ms_poly", None)
+    min_note_dur_s_poly = float(min_note_dur_ms_poly) / 1000.0 if min_note_dur_ms_poly is not None else None
     gap_tolerance_s = float(resolve_val("gap_tolerance_s", 0.05))
 
     min_db = float(_get(config, "stage_c.velocity_map.min_db", -40.0))
@@ -923,11 +960,7 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
         min_rms = max(min_rms, nf * (10 ** (margin / 20.0)))
 
     timelines_to_process: List[Tuple[str, List[FramePitch]]] = [(stem_name, primary_timeline)]
-    audio_type = getattr(analysis_data.meta, "audio_type", None)
-    allow_secondary = audio_type in (
-        getattr(AudioType, "POLYPHONIC", None),
-        getattr(AudioType, "POLYPHONIC_DOMINANT", None),
-    )
+    allow_secondary = poly_context
 
     if allow_secondary and len(stem_timelines) > 1:
         other_keys = sorted([k for k in stem_timelines.keys() if k != stem_name])
@@ -935,6 +968,13 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
             timelines_to_process.append((other_name, stem_timelines[other_name]))
 
     notes: List[NoteEvent] = []
+    voice_settings_diag: List[Dict[str, Any]] = []
+    hop_hint = _get(
+        analysis_data.diagnostics,
+        "resolved_params.timebase.frame_hop_seconds",
+        None,
+    )
+    hop_hint = float(hop_hint) if hop_hint else None
 
     seg_method = str(seg_cfg.get("method") or _get(config, "stage_c.segmentation_method", "threshold")).lower()
     smoothing_enabled = bool(seg_cfg.get("use_state_smoothing", _get(config, "stage_c.use_state_smoothing", False)))
@@ -953,15 +993,27 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
     poly_pitch_tolerance = float(_get(config, "stage_c.pitch_tolerance_cents", 50.0))
 
     poly_used = False
+    lead_likeness = {"continuity_frames": 0, "frames": 0, "prominence_sum": 0.0}
 
     for vidx, (_vname, timeline) in enumerate(timelines_to_process):
         try:
             if not timeline or len(timeline) < 2:
                 continue
 
+            # Timebase sanity: ensure timeline times are strictly increasing
+            times = [fp.time for fp in timeline]
+            if any((times[i] <= times[i - 1]) for i in range(1, len(times))):
+                analysis_data.diagnostics.setdefault("health_flags", []).append("timebase_mismatch")
+
             if poly_filter_mode == "skyline_top_voice":
                 new_tl: List[FramePitch] = []
                 skyline_conf_thr = max(0.05, min(conf_thr * 0.5, 0.2))
+                skyline_weights = _get(config, "stage_c.skyline_bias", {"enabled": True, "weight": 0.1})
+                w_conf = 0.7
+                w_cont = 0.2
+                w_band = float(skyline_weights.get("weight", 0.0)) if skyline_weights.get("enabled", False) else 0.1
+                fmin_band = float(_get(config, "stage_b.melody_filtering.fmin_hz", 80.0))
+                fmax_band = float(_get(config, "stage_b.melody_filtering.fmax_hz", 1600.0))
                 for fp in timeline:
                     ap = getattr(fp, "active_pitches", []) or []
                     cand = [(p, c) for (p, c) in ap if p > 0.0 and c >= skyline_conf_thr]
@@ -975,17 +1027,17 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
                         if len(contestants) > 1:
                             scored_candidates = []
                             for p, c in contestants:
-                                score = c
-                                if 80.0 <= p <= 1400.0:
-                                    score += 0.05
+                                band_bonus = 0.1 if (fmin_band <= p <= fmax_band) else 0.0
+                                cont_bonus = 0.0
                                 if prev_pitch > 0.0:
                                     cents_diff = abs(1200.0 * math.log2(p / prev_pitch))
-                                    if cents_diff < 100:
-                                        score += 0.1
-                                    elif cents_diff < 1200:
-                                        score += 0.05
+                                    if cents_diff < 50:
+                                        cont_bonus += 0.15
+                                    elif cents_diff < 300:
+                                        cont_bonus += 0.05
                                     else:
-                                        score -= 0.05
+                                        cont_bonus -= 0.05
+                                score = w_conf * c + w_cont * cont_bonus + w_band * band_bonus
                                 scored_candidates.append(((p, c), score))
                             best_cand = max(scored_candidates, key=lambda x: x[1])[0]
 
@@ -1003,6 +1055,21 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
                     else:
                         new_tl.append(fp)
                 timeline = new_tl
+
+            # Lead-likeness metrics (continuity/prominence)
+            for i, fp in enumerate(timeline):
+                if fp.pitch_hz > 0:
+                    lead_likeness["frames"] += 1
+                    ap = getattr(fp, "active_pitches", []) or []
+                    if ap:
+                        ap_sorted = sorted(ap, key=lambda x: x[1], reverse=True)
+                        top_conf = ap_sorted[0][1]
+                        sum_conf = sum(c for _, c in ap_sorted) + 1e-9
+                        lead_likeness["prominence_sum"] += float(top_conf / sum_conf)
+                if i > 0 and timeline[i - 1].pitch_hz > 0 and fp.pitch_hz > 0:
+                    cents_diff = abs(1200.0 * math.log2(fp.pitch_hz / timeline[i - 1].pitch_hz))
+                    if cents_diff < 200.0:
+                        lead_likeness["continuity_frames"] += 1
 
             poly_frames = [fp for fp in timeline if getattr(fp, "active_pitches", []) and len(fp.active_pitches) > 1]
             enable_polyphony = (len(poly_frames) > 0) and (poly_filter_mode != "skyline_top_voice")
@@ -1041,8 +1108,8 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
             if poly_frames or enable_polyphony:
                 voice_conf_gate = poly_conf if vidx == 0 else accomp_conf
                 try:
-                    if min_note_dur_ms_poly is not None:
-                        voice_min_dur_s = max(voice_min_dur_s, float(min_note_dur_ms_poly) / 1000.0)
+                    if min_note_dur_s_poly is not None:
+                        voice_min_dur_s = max(1e-6, float(min_note_dur_s_poly))
                 except Exception:
                     pass
 
@@ -1051,7 +1118,18 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
             elif vidx > 0:
                 voice_conf_gate = max(voice_conf_gate, accomp_conf)
 
-            hop_s = _estimate_hop_seconds(timeline)
+            voice_settings_diag.append(
+                {
+                    "timeline": _vname,
+                    "voice_index": vidx,
+                    "poly_frames": bool(poly_frames),
+                    "enable_polyphony": bool(enable_polyphony),
+                    "voice_conf_gate": float(voice_conf_gate),
+                    "voice_min_note_dur_ms": float(voice_min_dur_s * 1000.0),
+                }
+            )
+
+            hop_s = hop_hint if hop_hint else _estimate_hop_seconds(timeline)
 
             for sub_idx, sub_tl in enumerate(voice_timelines):
                 if not any(fp.pitch_hz > 0 for fp in sub_tl):
@@ -1203,14 +1281,44 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
     raw_notes = _sanitize_notes(notes)
     analysis_data.notes_before_quantization = list(raw_notes)
 
+    # Octave cleanup (reduce ±12 semitone flips)
+    octave_corrections = 0
+    cleaned_notes = []
+    for n in sorted(raw_notes, key=lambda x: x.start_sec):
+        if cleaned_notes:
+            prev = cleaned_notes[-1]
+            delta = n.midi_note - prev.midi_note
+            if abs(abs(delta) - 12) < 0.6:
+                # Snap to closest octave for continuity
+                new_midi = n.midi_note - 12 if delta > 0 else n.midi_note + 12
+                n.midi_note = new_midi
+                n.pitch_hz = _midi_to_hz(new_midi)
+                octave_corrections += 1
+        cleaned_notes.append(n)
+    raw_notes = cleaned_notes
+
     if hasattr(analysis_data, "diagnostics"):
-        analysis_data.diagnostics["stage_c"] = {
+        stage_c_diag = dict(analysis_data.diagnostics.get("stage_c", {}) or {})
+        stage_c_diag.update({
             "segmentation_method": seg_method,
             "timelines_processed": len(timelines_to_process),
             "note_count_raw": len(raw_notes),
             "selected_stem": stem_name,
             "quantize_enabled": quantize_enabled,
-        }
+            "polyphonic_context": stage_c_context,
+            "voice_settings": voice_settings_diag,
+            "lead_likeness": {
+                "continuity_ratio": float(lead_likeness["continuity_frames"] / max(1, lead_likeness["frames"])),
+                "prominence_mean": float(lead_likeness["prominence_sum"] / max(1, lead_likeness["frames"])),
+            },
+            "skyline_weights": {
+                "confidence": 0.7,
+                "continuity": 0.2,
+                "band": float(_get(config, "stage_c.skyline_bias.weight", 0.0)) if _get(config, "stage_c.skyline_bias.enabled", False) else 0.1,
+            },
+            "octave_corrections": int(octave_corrections),
+        })
+        analysis_data.diagnostics["stage_c"] = stage_c_diag
         analysis_data.diagnostics["stage_c_post"] = {
             "gap_merges": int(locals().get("gap_merges", 0) or 0),
             "chord_snaps": int(locals().get("chord_snaps", 0) or 0),
@@ -1223,6 +1331,13 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
         return list(raw_notes)
 
     quantized_notes = quantize_notes(raw_notes, analysis_data=analysis_data)
+    # Note-density clamp (export guardrail) only if duration is known
+    total_dur = float(getattr(getattr(analysis_data, "meta", None), "duration_sec", 0.0) or 0.0)
+    if total_dur > 0.0:
+        notes_per_sec = float(len(quantized_notes)) / max(total_dur, 1e-6)
+        if notes_per_sec > 12.0:
+            analysis_data.diagnostics.setdefault("health_flags", []).append("note_density_clamped")
+            quantized_notes = []
     analysis_data.notes = quantized_notes
     return quantized_notes
 

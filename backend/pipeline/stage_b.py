@@ -344,6 +344,7 @@ def compute_decision_trace(
         },
         "routing_features": dict(routing_features),
         "rule_hits": list(rule_hits),
+        "routing_reasons": [r["rule_id"] for r in rule_hits if r.get("passed")],
         "separation": {
             "ran": False,
             "backend": "none",
@@ -967,6 +968,7 @@ def _resolve_separation(
         "resolved_overlap": overlap,
         "resolved_shifts": shifts,
         "shift_range": preset_conf.get("shift_range", None),
+        "backend": "synthetic_mdx" if use_synth else "demucs",
     }
 
     try:
@@ -1001,10 +1003,25 @@ def _resolve_separation(
                 continue
             out_audio = np.asarray(v, dtype=np.float32).reshape(-1)
 
+            resampled = False
             if len(out_audio) != target_len and target_len > 0 and len(out_audio) > 0:
                 x_old = np.linspace(0, 1, len(out_audio))
                 x_new = np.linspace(0, 1, target_len)
                 out_audio = np.interp(x_new, x_old, out_audio).astype(np.float32)
+                resampled = True
+
+            diag_extras.setdefault("alignment", []).append({
+                "stem": k,
+                "sr_in": mix_stem.sr,
+                "sr_out": mix_stem.sr,
+                "len_in": target_len,
+                "len_out": len(out_audio),
+                "resampled": resampled,
+            })
+
+            # Hard assertion to avoid silent drift
+            if target_len > 0 and abs(len(out_audio) - target_len) > max(2, 0.01 * target_len):
+                raise RuntimeError(f"Separation alignment failed for stem {k}: {len(out_audio)} vs {target_len}")
 
             final_stems[k] = type(mix_stem)(audio=out_audio, sr=target_sr, type=k)
 
