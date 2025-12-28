@@ -4,88 +4,76 @@ This document outlines the detailed call graph, data flow, algorithms, and confi
 
 ## Detailed Pipeline Flowchart
 
-This chart details the end-to-end flow, including Signal Conditioning, Routing Logic, Source Separation, Polyphonic Processing, and Rendering.
+This chart details the end-to-end flow, including Signal Conditioning, the Unified Quality Gate loop, Routing Logic, Source Separation, Polyphonic Processing, and Rendering.
 
 ```mermaid
 flowchart TD
     %% --- STAGE A ---
     subgraph StageA [Stage A: Signal Conditioning]
         direction TB
-        Start(Audio Input) --> SA_Cond[Resample / Mono / Trim]
-        SA_Cond --> SA_Norm[Loudness Norm <br> EBU R128 / RMS]
-        SA_Norm --> SA_Trans[Transient Emphasis <br> Warped LPC]
-        SA_Trans --> SA_Anal[Global Analysis <br> BPM / AudioType]
+        Start(Audio Input) --> SA_Load[Load / Resample / Mono]
+        SA_Load --> SA_Anal[Global Analysis <br> BPM / AudioType / Density]
+        SA_Anal --> SA_Norm[Loudness Norm / Transient Emphasis]
     end
 
-    %% Decision: Neural E2E vs Standard
-    SA_Anal --> CheckE2E{E2E Mode?}
-    CheckE2E -- Yes --> NeuralTrans[Neural Transcription <br> Basic Pitch / O&F]
-    NeuralTrans --> StageD
+    SA_Norm --> QGate_Start{Unified Quality Gate <br> Loop Candidates}
 
-    CheckE2E -- No --> SB_Start
-
-    %% --- STAGE B ---
-    subgraph StageB [Stage B: Feature Extraction]
+    %% --- QUALITY GATE LOOP ---
+    subgraph QualityLoop [Candidate Evaluation Loop]
         direction TB
-        SB_Start(Input Context) --> SB_Route[Decision Trace <br> Routing v1]
+        QGate_Start -- Next Candidate --> B_Decide[Decision Trace <br> Routing v1]
         
-        %% Separation Logic
-        SB_Route --> SB_Sep{Separation?}
-        SB_Sep -- Yes --> SB_Demucs[HTDemucs / Synthetic <br> Extract Stems]
-        SB_Sep -- No --> SB_Mix[Use Mix Stem]
+        %% Path 1: Neural E2E (Onsets & Frames)
+        B_Decide -- E2E O&F --> E2E_OAF[Neural Transcription <br> Onsets & Frames]
         
-        SB_Demucs --> SB_Stems(Stems: Vocals, Bass...)
-        SB_Mix --> SB_Stems
+        %% Path 2: Neural E2E (Basic Pitch)
+        B_Decide -- E2E BasicPitch --> E2E_BP_B[Stage B <br> Basic Pitch Wrap]
+        E2E_BP_B --> E2E_BP_C[Stage C <br> Quantize Only]
         
-        %% Detector Bank (Applied per Stem)
-        subgraph Per_Stem [Per-Stem Processing]
-            direction TB
-            SB_Stems --> SB_Pre[Pre-Process <br> LPF / Lockout]
-            SB_Pre --> SB_Detect[Detector Bank]
-            
-            subgraph Detectors [Algorithms]
-               D_YIN[YIN]
-               D_Swift[SwiftF0]
-               D_Crepe[CREPE]
-               D_Other[...]
-            end
-            SB_Detect --- Detectors
-            
-            Detectors --> SB_Ens[Ensemble Fusion <br> Static / Adaptive]
-            
-            %% Polyphony / ISS
-            SB_Ens --> SB_Poly{Poly Context?}
-            SB_Poly -- Yes --> SB_ISS[ISS Peeling <br> Freq-Aware / Adaptive]
-            SB_ISS --> SB_Layers(Main + Layers)
-            SB_Poly -- No --> SB_Layers
-            
-            SB_Layers --> SB_Smooth[Smoothing <br> Viterbi / Tracker]
+        %% Path 3: Classic Pipeline
+        B_Decide -- Classic --> B_Sep{Separation?}
+
+        B_Sep -- Yes --> B_Demucs[HTDemucs / SyntheticMDX <br> Extract Stems]
+        B_Sep -- No --> B_Mix[Use Mix Stem]
+
+        B_Demucs --> B_Proc[Stem Processing]
+        B_Mix --> B_Proc
+
+        subgraph StageB [Stage B: Feature Extraction]
+            B_Proc --> B_Detect[Detector Bank <br> YIN / SwiftF0 / CREPE]
+            B_Detect --> B_Fusion[Ensemble Fusion <br> Static / Adaptive]
+            B_Fusion --> B_Poly{Poly Context?}
+            B_Poly -- Yes --> B_ISS[ISS Peeling <br> Iterative Spectral Subtraction]
+            B_Poly -- No --> B_Smooth
+            B_ISS --> B_Smooth[Smoothing <br> Viterbi / Tracker]
         end
+
+        B_Smooth --> StageC
+        E2E_BP_C --> Score_Cand
+        
+        subgraph StageC [Stage C: Segmentation & Theory]
+            SC_Input[Input Timelines] --> SC_Filter{Poly Filter?}
+            SC_Filter -- Skyline --> SC_Sky[Skyline Top Voice]
+            SC_Filter -- Decompose --> SC_Dec[Graph Search Decomposition]
+
+            SC_Sky & SC_Dec --> SC_Seg[Segmentation <br> HMM / Threshold]
+            SC_Seg --> SC_Refine[Refinement <br> Onset Snap / Splitter]
+            SC_Refine --> SC_Post[Post-Processing <br> Gap Merge / Chord Snap]
+        end
+        
+        E2E_OAF --> Score_Cand
+        SC_Post --> Score_Cand
+
+        Score_Cand[Score Candidate <br> Quality Metrics]
     end
 
-    SB_Smooth --> StageC
-
-    %% --- STAGE C ---
-    subgraph StageC [Stage C: Segmentation]
-        direction TB
-        SC_Sel[Stem Selection] --> SC_Filter{Poly Filter?}
-        
-        SC_Filter -- Skyline --> SC_Sky[Skyline Top Voice <br> Bias Vocal Range]
-        SC_Filter -- Decompose --> SC_Dec[Full Decomposition <br> Graph Search]
-        
-        SC_Sky & SC_Dec --> SC_Seg[Segmentation <br> HMM / Threshold]
-        SC_Seg --> SC_Refine[Refinement <br> Onset Snap / Splitter]
-        SC_Refine --> SC_Post[Post-Processing <br> Gap Merge / Chord Snap]
-    end
-
-    SC_Post --> StageD
+    Score_Cand -- Rejected --> QGate_Start
+    Score_Cand -- Accepted / Best --> StageD
 
     %% --- STAGE D ---
     subgraph StageD [Stage D: Rendering]
-        direction TB
-        SD_Quant[Quantization <br> Grid / Light Rubato] --> SD_Voice[Voice Assignment <br> Treble / Bass Split]
-        SD_Voice --> SD_Gliss[Glissando Detection]
-        SD_Gliss --> SD_Exp[Export <br> MusicXML / MIDI]
+        SD_Quant[Quantization <br> Grid / Light Rubato] --> SD_Voice[Voice Assignment]
+        SD_Voice --> SD_Exp[Export <br> MusicXML / MIDI]
     end
 
     SD_Exp --> End(Final Output)
@@ -100,42 +88,41 @@ flowchart TD
 *   **Global Analysis**:
     *   **BPM Detection**: `librosa.beat.beat_track` with clamping/octave correction.
     *   **Texture Detection**: Heuristics classify audio as Monophonic, Polyphonic, or Poly-Dominant (`AudioType`).
-*   **E2E Bypass**: If `transcription_mode` is set to "e2e_basic_pitch" or "onsets_and_frames", the classic detector pipeline is bypassed.
 
-### Stage B: Selection & Detectors
+### Unified Quality Gate (Candidate Loop)
+The pipeline employs a "Unified Quality Gate" in `transcribe.py` that iterates through a list of candidate strategies (e.g., `e2e_onsets_frames`, `classic_piano_poly`, `classic_melody`) until one passes quality thresholds.
+*   **Scoring**: Each candidate result is scored based on `voiced_ratio`, `note_count`, `notes_per_sec` (density), and fragmentation.
+*   **Fallback**: If a candidate (e.g., E2E) fails or produces low-quality output, the system falls back to the next strategy (e.g., Classic).
+
+### Stage B: Feature Extraction
 *   **Decision Trace (Routing v1)**:
     *   Evaluates input features (density, mixture score) to deterministically resolve `transcription_mode` ("classic", "e2e", "auto") and parameters.
-*   **Source Separation**:
+*   **E2E Paths**:
+    *   **Onsets & Frames**: Bypass Stage B/C core logic; calls neural model directly.
+    *   **Basic Pitch**: Wraps the neural model in Stage B to produce "precalculated notes", which then flow through Stage C for quantization.
+*   **Source Separation (Classic)**:
     *   **HTDemucs**: Neural separation for vocals/bass/drums.
     *   **SyntheticMDX**: Fast, template-based separation for L2 benchmarks.
-*   **Pre-Processing**:
-    *   **LPF**: Low-pass filter for distorted signals (e.g., electric guitar).
-    *   **Lockout**: Zeroes confidence during high-energy transients to prevent pitch errors.
-*   **Detector Bank**: Up to six algorithms run in parallel:
-    *   **YIN/SACF**: Robust DSP methods for bass and clean signals.
-    *   **SwiftF0/RMVPE/CREPE**: High-accuracy neural estimators.
-    *   **CQT**: Spectral analysis validator.
-
-### Stage B: Polyphony & Ensemble
+*   **Detector Bank**: Up to six algorithms run in parallel (YIN, SwiftF0, CREPE, etc.).
 *   **Ensemble Fusion**:
     *   **Static**: Traditional weighted averaging.
     *   **Adaptive**: Reliability-gated weighted median (robust against outliers; penalizes unstable detectors).
-*   **Polyphony (ISS)**: **Iterative Spectral Subtraction** peels accompaniment voices.
-    *   **Adaptive Strength**: Adjusts subtraction depth based on residual energy.
-    *   **Frequency-Aware Masks**: Wider masks for bass frequencies to capture dense harmonics.
+*   **Polyphony (ISS)**: **Iterative Spectral Subtraction** peels accompaniment voices using frequency-aware masking and adaptive strength.
 *   **Smoothing**:
     *   **Tracker**: Hungarian assignment for voice continuity.
     *   **Viterbi**: HMM-based pathfinding for optimal global pitch contour.
 
-### Stage C: Segmentation
-*   **Note Extraction**:
-    *   **Skyline Top Voice**: Biases selection towards the vocal range (80-1400Hz) and continuity/confidence.
+### Stage C: Segmentation & Theory
+*   **Stem Selection**: Picks the best stem (e.g., Vocals vs Mix) based on voiced coverage and confidence.
+*   **Polyphony Filter**:
+    *   **Skyline Top Voice**: Biases selection towards the vocal range (80-1400Hz) and continuity.
     *   **Decomposed Melody**: Fully decomposes polyphony and picks the strongest track (L5 optimization).
+*   **Segmentation**: Converts frame-wise pitch probability to note events using HMM or Threshold logic.
 *   **Refinement**:
     *   **Onset Snapping (`snap_onset`)**: Aligns note starts to local peaks in spectral flux (onset strength).
     *   **Repeated Note Splitter**: Detects re-articulations (energy bumps) within sustained pitch segments.
 *   **Post-Processing**:
-    *   **Gap Merging**: Bridges micro-gaps (<60ms) in legato phrases.
+    *   **Gap Merging**: Bridges micro-gaps (<60ms) in legato phrases (prioritizes `post_merge.max_gap_ms`).
     *   **Chord Snapping**: Aligns nearly-simultaneous onsets to form clean chords.
 
 ### Stage D: Quantization & Rendering
@@ -189,7 +176,8 @@ The following parameters are exposed for iterative tuning and audit verification
     *   `use_onset_refinement`: Snap start times to flux peaks.
     *   `use_repeated_note_splitter`: Split long notes on energy re-articulation.
     *   `chord_onset_snap_ms`: Tolerance for snapping simultaneous notes.
-    *   `gap_filling.max_gap_ms`: Max gap to bridge for legato.
+    *   `post_merge.max_gap_ms`: Max gap to bridge for legato (prioritized).
+    *   `gap_filling.max_gap_ms`: Legacy gap filling parameter.
 
 ### Stage D: Quantization
 *   `quantization_mode`: "grid" or "light_rubato".
