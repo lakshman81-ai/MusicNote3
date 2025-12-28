@@ -422,17 +422,6 @@ const HistoryModal: React.FC<HistoryModalProps> = ({ isOpen, onClose, onLoadEntr
                     </div>
                 </div>
 
-                {/* Primary Action Button */}
-                <div className="pt-6 border-t border-zinc-800">
-                    <button 
-                        onClick={() => { onLoadEntry(selectedEntry); onClose(); }}
-                        className="w-full py-4 bg-gradient-to-r from-indigo-600 to-indigo-500 hover:from-indigo-500 hover:to-indigo-400 text-white rounded-xl shadow-lg shadow-indigo-500/20 font-bold text-lg flex items-center justify-center gap-3 transition-all transform hover:scale-[1.01]"
-                    >
-                        <RefreshIcon className="w-5 h-5" />
-                        Re-open Project Session
-                    </button>
-                </div>
-
               </div>
             ) : (
               <div className="h-full flex flex-col items-center justify-center text-zinc-600 opacity-60">
@@ -443,6 +432,19 @@ const HistoryModal: React.FC<HistoryModalProps> = ({ isOpen, onClose, onLoadEntr
             )}
           </div>
         </div>
+
+        {/* Primary Action Button */}
+        <div className="p-4 border-t border-zinc-800 bg-zinc-900/70">
+          <button 
+              onClick={() => { if (selectedEntry) { onLoadEntry(selectedEntry); onClose(); } }}
+              disabled={!selectedEntry}
+              className={`w-full py-4 rounded-xl font-bold text-lg flex items-center justify-center gap-3 transition-all ${selectedEntry ? 'bg-gradient-to-r from-indigo-600 to-indigo-500 hover:from-indigo-500 hover:to-indigo-400 text-white shadow-lg shadow-indigo-500/20' : 'bg-zinc-800 text-zinc-500 cursor-not-allowed'}`}
+          >
+              <RefreshIcon className="w-5 h-5" />
+              {selectedEntry ? 'Re-open Project Session' : 'Select an entry to load'}
+          </button>
+        </div>
+
       </div>
     </div>
   );

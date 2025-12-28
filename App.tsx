@@ -67,6 +67,7 @@ const App: React.FC = () => {
   const audioRef = useRef<HTMLAudioElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const audioBufferRef = useRef<AudioBuffer | null>(null); // Store decoded audio
+  const uploadObjectUrlRef = useRef<string | null>(null);
 
   // --- Scroll Synchronization Refs ---
   const sheetMusicScrollRef = useRef<HTMLDivElement>(null);
@@ -177,8 +178,14 @@ const App: React.FC = () => {
       setIsRestricted(false);
       setIsProcessing(false);
       audioBufferRef.current = null; // Clear buffer
+      if (uploadObjectUrlRef.current) {
+          URL.revokeObjectURL(uploadObjectUrlRef.current);
+          uploadObjectUrlRef.current = null;
+      }
       if (audioRef.current) audioRef.current.currentTime = 0;
       setSeekTarget(0);
+      setSuggestedSettings(null);
+      setIsSuggestionOpen(false);
   };
 
   const createHistoryEntry = (title: string, sourceType: 'file' | 'youtube', sourceUrl: string | null, duration: number) => {
@@ -218,6 +225,7 @@ const App: React.FC = () => {
         const buffer = await audioEngine.loadAudioFile(file);
         audioBufferRef.current = buffer;
         const url = URL.createObjectURL(file);
+        uploadObjectUrlRef.current = url;
         
         setAudioCrossOrigin(undefined); 
         setAudioState(prev => ({ 
@@ -234,6 +242,9 @@ const App: React.FC = () => {
         setMusicXML(result.xml);
         setTranscribedNotes(result.notes);
         setDetectedChords(result.chords);
+        const suggestion = SuggestionService.generateSuggestions(result.notes);
+        setSuggestedSettings(suggestion);
+        setIsSuggestionOpen(!!suggestion);
 
         showToast("Transcription Complete", "success");
         createHistoryEntry(file.name, 'file', null, buffer.duration);
@@ -247,8 +258,9 @@ const App: React.FC = () => {
     }
   };
 
-  const handleYoutubeLoad = () => {
-    const id = getYoutubeId(ytUrl);
+  const handleYoutubeLoad = (urlOverride?: string) => {
+    const targetUrl = urlOverride ?? ytUrl;
+    const id = getYoutubeId(targetUrl);
     if (!id) {
         showToast("Invalid YouTube URL", "error");
         return;
@@ -257,7 +269,8 @@ const App: React.FC = () => {
     showToast("Loading Music...", "loading");
     setYtVideoId(id);
     setAudioCrossOrigin('anonymous');
-    setAudioState(prev => ({ ...prev, sourceType: 'youtube', sourceUrl: ytUrl }));
+    setYtUrl(targetUrl);
+    setAudioState(prev => ({ ...prev, sourceType: 'youtube', sourceUrl: targetUrl }));
   };
 
   const onYoutubePlayerReady = (duration: number) => {
@@ -392,6 +405,26 @@ const App: React.FC = () => {
     setIsSuggestionOpen(false);
   };
 
+  const handleLoadHistoryEntry = (entry: HistoryEntry) => {
+    if (entry.source_type === 'youtube' && entry.source_url) {
+        handleYoutubeLoad(entry.source_url);
+        showToast("Loading project from history...", "info");
+    } else if (entry.source_type === 'file') {
+        showToast("Please re-upload the original file to restore this session.", "info");
+    } else {
+        showToast("This history item cannot be reloaded automatically.", "info");
+    }
+  };
+
+  useEffect(() => {
+    return () => {
+        if (uploadObjectUrlRef.current) {
+            URL.revokeObjectURL(uploadObjectUrlRef.current);
+            uploadObjectUrlRef.current = null;
+        }
+    };
+  }, []);
+
   // Check if player is strictly enabled
   const isPlayDisabled = 
     isProcessing || 
@@ -409,7 +442,7 @@ const App: React.FC = () => {
       />
       
       <HistoryModal 
-        isOpen={isHistoryOpen} onClose={() => setIsHistoryOpen(false)} onLoadEntry={() => {}}
+        isOpen={isHistoryOpen} onClose={() => setIsHistoryOpen(false)} onLoadEntry={handleLoadHistoryEntry}
       />
 
       <SuggestionPopup
