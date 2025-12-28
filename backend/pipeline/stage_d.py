@@ -3,6 +3,7 @@ import numpy as np
 import tempfile
 import os
 import math
+import copy
 try:
     import music21
     from music21 import (
@@ -124,6 +125,9 @@ def quantize_and_render(
         )
 
     d_conf = config.stage_d
+
+    # Work on a deep copy of events to avoid mutating upstream note buffers (e.g., notes_before_quantization)
+    events = copy.deepcopy(list(events) if events is not None else [])
 
     # D1: Tempo/time signature export
     bpm = analysis_data.meta.tempo_bpm

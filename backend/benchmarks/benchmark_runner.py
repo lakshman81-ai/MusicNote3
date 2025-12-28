@@ -1924,12 +1924,30 @@ class BenchmarkSuite:
             analysis = getattr(transcription, "analysis_data", None)
 
         notes_obj = None
+        notes_source = None
         if analysis is not None:
-            notes_obj = getattr(analysis, "notes_before_quantization", None) or getattr(analysis, "notes", None)
+            notes_before = getattr(analysis, "notes_before_quantization", None)
+            if notes_before is not None:
+                notes_obj = notes_before
+                notes_source = "notes_before_quantization"
+            else:
+                notes_obj = getattr(analysis, "notes", None)
+                if notes_obj is not None:
+                    notes_source = "notes"
         if notes_obj is None and "notes" in res:
-             notes_obj = res.get("notes", [])
+            notes_obj = res.get("notes", [])
 
         # If we have objects, convert to tuples
+        if analysis is not None:
+            try:
+                analysis.diagnostics = getattr(analysis, "diagnostics", {}) or {}
+                if notes_source == "notes_before_quantization":
+                    analysis.diagnostics["scored_notes_source"] = "pre_quantization"
+                elif notes_source is not None:
+                    analysis.diagnostics["scored_notes_source"] = notes_source
+            except Exception:
+                pass
+
         if notes_obj is not None:
             pred_list = [
                 (int(getattr(n, "midi_note", 0)), float(getattr(n, "start_sec", 0.0)), float(getattr(n, "end_sec", 0.0)))
