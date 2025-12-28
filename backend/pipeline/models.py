@@ -78,6 +78,11 @@ class MetaData:
     # Extended robust fields
     audio_path: Optional[str] = None
     n_channels: int = 1
+    original_n_channels: int = 1
+    processed_n_channels: int = 1
+    downmix_applied: bool = False
+    channel_handling_policy: str = ""
+    channel_map: str = ""
     normalization_gain_db: float = 0.0
     loudness_measurement: str = "unmeasured"
     loudness_or_rms: float = -float("inf")     # measured before normalization

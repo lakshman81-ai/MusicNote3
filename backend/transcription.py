@@ -120,18 +120,35 @@ def transcribe_audio_pipeline(
     # stem_timelines is available.
     stem_timelines = stage_b_out.stem_timelines or {}
 
-    # We need a global timeline for AnalysisData.
-    # In my previous implementation, I aggregated it.
-    # Now I should aggregate it again or use what's available.
-    if "vocals" in stem_timelines:
-        timeline = stem_timelines["vocals"]
-    elif "mix" in stem_timelines:
-        timeline = stem_timelines["mix"]
-    elif "other" in stem_timelines:
-        timeline = stem_timelines["other"]
+    def _timeline_score(tl: list) -> float:
+        if not tl:
+            return -1.0
+        voiced = [fp for fp in tl if (getattr(fp, "pitch_hz", 0.0) or 0.0) > 0 or (getattr(fp, "midi", None) is not None and getattr(fp, "midi") > 0)]
+        if not voiced:
+            return -0.5
+        voiced_ratio = len(voiced) / float(len(tl))
+        mean_conf = float(np.mean([getattr(fp, "confidence", 0.0) for fp in voiced])) if voiced else 0.0
+        mean_rms = float(np.mean([getattr(fp, "rms", 0.0) for fp in voiced])) if voiced else 0.0
+        return voiced_ratio * 0.5 + mean_conf * 0.4 + min(mean_rms, 1.0) * 0.1
+
+    # Prefer the highest-quality stem timeline instead of a fixed priority.
+    if stem_timelines:
+        scored = sorted(((name, tl, _timeline_score(tl)) for name, tl in stem_timelines.items()), key=lambda x: x[2], reverse=True)
+        timeline = scored[0][1]
     elif getattr(stage_b_out, "timeline", None):
         timeline = stage_b_out.timeline
     elif getattr(stage_b_out, "time_grid", None) is not None and getattr(stage_b_out, "f0_main", None) is not None:
+        timeline = [
+            FramePitch(
+                time=float(t),
+                pitch_hz=float(p),
+                midi=None if p <= 0 else int(round(librosa.hz_to_midi(p))),
+                confidence=1.0,
+            )
+            for t, p in zip(stage_b_out.time_grid, stage_b_out.f0_main)
+        ]
+
+    if not timeline and getattr(stage_b_out, "time_grid", None) is not None and getattr(stage_b_out, "f0_main", None) is not None:
         timeline = [
             FramePitch(
                 time=float(t),
@@ -152,14 +169,34 @@ def transcribe_audio_pipeline(
     # We need to extract beats and onsets for Stage C.
 
     beat_stem_audio = None
-    if "drums" in stage_a_out.stems:
-        beat_stem_audio = stage_a_out.stems["drums"].audio
-    elif "other" in stage_a_out.stems: # If no drums (e.g. just other?)
-        beat_stem_audio = stage_a_out.stems["other"].audio
-    elif "vocals" in stage_a_out.stems: # Mono mix
-        beat_stem_audio = stage_a_out.stems["vocals"].audio
-    elif "mix" in stage_a_out.stems:
-        beat_stem_audio = stage_a_out.stems["mix"].audio
+    beat_candidates = []
+    for stem_name in ["drums", "other", "vocals", "mix"]:
+        if stem_name in stage_a_out.stems:
+            cand_audio = stage_a_out.stems[stem_name].audio
+            if cand_audio is not None and len(cand_audio) > 0:
+                cand_arr = np.asarray(cand_audio, dtype=np.float32)
+                if cand_arr.ndim > 1:
+                    cand_arr = np.mean(cand_arr, axis=-1)
+                # Short-window RMS to prefer stems with localized energy.
+                window_len = min(len(cand_arr), int(stage_a_out.meta.target_sr * 30))
+                rms_val = float(np.sqrt(np.mean(cand_arr[:window_len] ** 2))) if window_len > 0 else 0.0
+                beat_candidates.append((rms_val, stem_name, cand_arr))
+    onset_strength_best = -1.0
+    if beat_candidates:
+        beat_candidates.sort(key=lambda x: x[0], reverse=True)
+        beat_stem_audio = beat_candidates[0][2]
+        try:
+            onset_env = librosa.onset.onset_strength(y=beat_stem_audio, sr=stage_a_out.meta.target_sr)
+            onset_strength_best = float(np.mean(onset_env)) if onset_env.size else -1.0
+        except Exception:
+            onset_strength_best = -1.0
+        # If chosen stem has very weak onset activity, fall back to mix if available.
+        if onset_strength_best < 0.5 and "mix" in stage_a_out.stems:
+            mix_audio = stage_a_out.stems["mix"].audio
+            if mix_audio is not None and len(mix_audio) > 0:
+                beat_stem_audio = np.asarray(mix_audio, dtype=np.float32)
+                if beat_stem_audio.ndim > 1:
+                    beat_stem_audio = np.mean(beat_stem_audio, axis=-1)
 
     onsets = [] # Global fallback
     beats = [] # Global beats

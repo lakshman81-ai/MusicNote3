@@ -130,6 +130,7 @@ def _compute_routing_features(mix_audio: np.ndarray, sr: int, duration_sec: floa
         "duration_sec": float(duration_sec or 0.0),
         "sr": int(sr or 0),
         "rms_mean": 0.0,
+        "rms_mean_stereo": 0.0,
         "spectral_centroid_mean": 0.0,
         "spectral_centroid_std": 0.0,
         "spectral_flatness_mean": 0.0,
@@ -139,13 +140,23 @@ def _compute_routing_features(mix_audio: np.ndarray, sr: int, duration_sec: floa
         "active_pitches_p95": 0.0,
         "synthetic_like": False,
         "mixture_score": 0.0,
+        "audio_used": "unknown",
     }
     missing = {"librosa": False}
 
     if mix_audio is None or sr <= 0:
         return feats, missing
 
-    y = np.asarray(mix_audio, dtype=np.float32).flatten()
+    y_stereo = np.asarray(mix_audio, dtype=np.float32)
+    feats["rms_mean_stereo"] = float(np.sqrt(np.mean(y_stereo * y_stereo) + 1e-12))
+
+    y = y_stereo
+    if y.ndim > 1:
+        y = np.mean(y, axis=-1)
+        feats["audio_used"] = "mono_mean"
+    else:
+        feats["audio_used"] = "mono_single"
+    y = y.flatten()
     if y.size == 0:
         return feats, missing
 
@@ -419,7 +430,9 @@ def _maybe_compute_cqt_ctx(audio: np.ndarray, sr: int, hop_length: int,
         return None
     try:
         import librosa
-        y = np.asarray(audio, dtype=np.float32).reshape(-1)
+        y = np.asarray(audio, dtype=np.float32)
+        if y.ndim > 1:
+            y = np.mean(y, axis=-1)
         if y.size == 0:
             return None
 
@@ -1344,7 +1357,10 @@ def _augment_with_harmonic_masks(
     if SCIPY_SIGNAL is None:
         return {}
 
-    audio = np.asarray(stem.audio, dtype=np.float32).reshape(-1)
+    audio = np.asarray(stem.audio, dtype=np.float32)
+    if audio.ndim > 1:
+        audio = np.mean(audio, axis=-1)
+    audio = audio.reshape(-1)
     if audio.size == 0:
         return {}
 
@@ -1839,11 +1855,16 @@ def extract_features(
     # Canonical n_frames aligned to framing logic (reduces mismatch churn)
     mix_stem_ref = stage_a_out.stems.get("mix") or next(iter(stage_a_out.stems.values()))
     n_fft_ref = int(stage_a_out.meta.window_size or 2048)
-    frames_ref = _frame_audio(np.asarray(mix_stem_ref.audio, dtype=np.float32), n_fft_ref, hop_length)
+    mix_ref_audio = np.asarray(mix_stem_ref.audio, dtype=np.float32)
+    if mix_ref_audio.ndim > 1:
+        mix_ref_audio = np.mean(mix_ref_audio, axis=-1)
+    frames_ref = _frame_audio(mix_ref_audio, n_fft_ref, hop_length)
     canonical_n_frames = int(frames_ref.shape[0])
 
     for stem_name, stem in stems_for_processing.items():
-        audio = np.asarray(stem.audio, dtype=np.float32).reshape(-1)
+        audio = np.asarray(stem.audio, dtype=np.float32)
+        if audio.ndim > 1:
+            audio = np.mean(audio, axis=-1)
         per_detector[stem_name] = {}
 
         if profile_special.get("ignore_pitch", False):
@@ -2223,11 +2244,59 @@ def extract_features(
         "decision_trace": decision_trace,
     }
 
-    primary_timeline = (
-        stem_timelines.get("vocals")
-        or stem_timelines.get("mix")
-        or (next(iter(stem_timelines.values())) if stem_timelines else [])
-    )
+    def _timeline_stats(tl: List[FramePitch]) -> Dict[str, float]:
+        if not tl:
+            return {"voiced_ratio": 0.0, "mean_conf": 0.0, "mean_rms": 0.0, "unique_pitch_bins": 0, "pitch_range": 0.0}
+        voiced = [fp for fp in tl if (getattr(fp, "pitch_hz", 0.0) or 0.0) > 0 or (getattr(fp, "midi", None) is not None and getattr(fp, "midi") > 0)]
+        if not voiced:
+            return {"voiced_ratio": 0.0, "mean_conf": 0.0, "mean_rms": 0.0, "unique_pitch_bins": 0, "pitch_range": 0.0}
+        voiced_ratio = len(voiced) / float(len(tl))
+        mean_conf = float(np.mean([getattr(fp, "confidence", 0.0) for fp in voiced])) if voiced else 0.0
+        mean_rms = float(np.mean([getattr(fp, "rms", 0.0) for fp in voiced])) if voiced else 0.0
+        midi_vals = []
+        for fp in voiced:
+            if getattr(fp, "midi", None) is not None:
+                midi_vals.append(int(getattr(fp, "midi")))
+            elif getattr(fp, "pitch_hz", 0.0) > 0:
+                midi_vals.append(int(round(69 + 12 * np.log2(float(fp.pitch_hz) / 440.0))))
+        unique_pitch_bins = len(set(midi_vals)) if midi_vals else 0
+        pitch_vals = [getattr(fp, "pitch_hz", 0.0) for fp in voiced if getattr(fp, "pitch_hz", 0.0) > 0]
+        pitch_range = float(max(pitch_vals) - min(pitch_vals)) if pitch_vals else 0.0
+        return {"voiced_ratio": voiced_ratio, "mean_conf": mean_conf, "mean_rms": mean_rms, "unique_pitch_bins": unique_pitch_bins, "pitch_range": pitch_range}
+
+    # Score timelines by voiced ratio + confidence, with RMS as a mild tie-breaker to avoid empty/weak stems.
+    def _timeline_score(tl: List[FramePitch]) -> float:
+        stats = _timeline_stats(tl)
+        if stats["voiced_ratio"] == 0.0 and stats["mean_conf"] == 0.0:
+            return -1.0 if len(tl) == 0 else -0.5
+        score = stats["voiced_ratio"] * 0.6 + stats["mean_conf"] * 0.35 + min(stats["mean_rms"], 1.0) * 0.05
+        if stats["unique_pitch_bins"] < 2 and stats["voiced_ratio"] > 0.05:
+            score -= 0.1
+        # Use a broad default musical range (~A0-C8); penalize if almost constant pitch.
+        if stats["pitch_range"] < 5.0 and stats["voiced_ratio"] > 0.1:
+            score -= 0.05
+        return score
+
+    if stem_timelines:
+        scored = sorted(((name, tl, _timeline_score(tl)) for name, tl in stem_timelines.items()), key=lambda x: x[2], reverse=True)
+        primary_timeline = scored[0][1] if scored else []
+        if diagnostics is not None:
+            diagnostics["primary_timeline_selected"] = scored[0][0] if scored else None
+            diagnostics["primary_timeline_score"] = scored[0][2] if scored else None
+        best_stats = _timeline_stats(primary_timeline)
+        # Guardrail: if best stem is too weak, prefer mix if available.
+        if scored and (scored[0][2] < 0.2 or best_stats["voiced_ratio"] < 0.05 or best_stats["mean_conf"] < 0.05) and "mix" in stem_timelines and stem_timelines["mix"]:
+            primary_timeline = stem_timelines["mix"]
+            if diagnostics is not None:
+                diagnostics["primary_timeline_selected"] = "mix_fallback"
+                diagnostics["primary_timeline_score"] = _timeline_score(primary_timeline)
+        if (not primary_timeline) and "mix" in stem_timelines and stem_timelines["mix"]:
+            primary_timeline = stem_timelines["mix"]
+            if diagnostics is not None:
+                diagnostics["primary_timeline_selected"] = "mix_fallback_empty"
+                diagnostics["primary_timeline_score"] = _timeline_score(primary_timeline)
+    else:
+        primary_timeline = []
 
     return StageBOutput(
         time_grid=time_grid,
