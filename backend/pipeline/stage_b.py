@@ -263,6 +263,19 @@ def compute_decision_trace(
         sr,
         duration_sec,
     )
+    # Prefer Stage A mixture complexity if available (propagated through meta/diagnostics)
+    stage_a_mix_diag = (getattr(stage_a_out, "diagnostics", {}) or {}).get("mixture_complexity", {}) or {}
+    stage_a_mix_score = float(getattr(getattr(stage_a_out, "meta", None), "mixture_complexity_score", 0.0) or 0.0)
+    stage_a_flatness = float(getattr(getattr(stage_a_out, "meta", None), "spectral_flatness_mean", 0.0) or 0.0)
+    stage_a_poly = float(getattr(getattr(stage_a_out, "meta", None), "polyphony_estimate", 0.0) or 0.0)
+
+    routing_features["stage_a_mixture_score"] = stage_a_mix_score
+    routing_features["stage_a_spectral_flatness"] = stage_a_flatness
+    routing_features["stage_a_polyphony_estimate"] = stage_a_poly
+    routing_features["mixture_score_routing"] = routing_features.get("mixture_score", 0.0)
+    routing_features["stage_a_mixture_method"] = stage_a_mix_diag.get("method", None)
+    if stage_a_mix_score > 0.0:
+        routing_features["mixture_score"] = stage_a_mix_score
 
     dense_thr = float(_get(config, "stage_b.routing.dense_poly_threshold", 1.8))
     song_mix_thr = float(_get(config, "stage_b.routing.song_like_mixture_score", 0.55))
@@ -880,7 +893,10 @@ def _resolve_separation(
     rf = routing_features or {}
     duration_sec = float(getattr(getattr(stage_a_out, "meta", None), "duration_sec", 0.0) or 0.0)
     synthetic_like = bool(rf.get("synthetic_like", False))
-    mixture_score = float(rf.get("mixture_score", 0.0) or 0.0)
+    routing_mixture_score = float(rf.get("mixture_score", 0.0) or 0.0)
+    stage_a_mix_score = float(rf.get("stage_a_mixture_score", 0.0) or 0.0)
+    complexity_score = stage_a_mix_score if stage_a_mix_score > 0.0 else routing_mixture_score
+    complexity_source = "stage_a" if stage_a_mix_score > 0.0 else "routing_features"
 
     gates = sep.get("gates", {}) or {}
     min_duration_sec = float(gates.get("min_duration_sec", 8.0))
@@ -904,14 +920,17 @@ def _resolve_separation(
                 "gates": {
                     "min_duration_sec": float(min_duration_sec),
                     "min_mixture_score": float(min_mixture_score),
-                    "bypass_if_synthetic_like": bool(bypass_if_synth),
-                },
-                "outputs": {"stems": ["mix"], "selected_primary_stem": "mix"},
-                "mode": "disabled",
-                "synthetic_ran": False,
-                "htdemucs_ran": False,
-                "fallback": False,
+                "bypass_if_synthetic_like": bool(bypass_if_synth),
             },
+            "outputs": {"stems": ["mix"], "selected_primary_stem": "mix"},
+            "mode": "disabled",
+            "synthetic_ran": False,
+            "htdemucs_ran": False,
+            "fallback": False,
+            "complexity_score": float(complexity_score),
+            "complexity_score_source": complexity_source,
+            "duration_sec": float(duration_sec),
+        },
         )
 
     if str(resolved_transcription_mode or "").startswith("e2e_"):
@@ -930,7 +949,7 @@ def _resolve_separation(
     if not use_synth:
         if bypass_if_synth and synthetic_like:
             skip_reasons.append("synthetic_like")
-        if mixture_score < min_mixture_score:
+        if complexity_score < min_mixture_score:
             skip_reasons.append("low_mixture_score")
 
     if skip_reasons:
@@ -969,6 +988,9 @@ def _resolve_separation(
         "resolved_shifts": shifts,
         "shift_range": preset_conf.get("shift_range", None),
         "backend": "synthetic_mdx" if use_synth else "demucs",
+        "complexity_score": float(complexity_score),
+        "complexity_score_source": complexity_source,
+        "duration_sec": float(duration_sec),
     }
 
     try:
@@ -1666,6 +1688,24 @@ def extract_features(
     except Exception:
         pass
 
+    separation_decision = {
+        "ran": bool(separation_diag.get("ran", False)),
+        "backend": separation_diag.get("backend"),
+        "mode": separation_diag.get("mode"),
+        "skip_reasons": list(separation_diag.get("skip_reasons", [])),
+        "duration_sec": float(getattr(stage_a_out.meta, "duration_sec", 0.0) or 0.0),
+        "min_duration_sec": float(separation_diag.get("gates", {}).get("min_duration_sec", 0.0)),
+        "complexity_score": float(separation_diag.get("complexity_score", routing_features.get("mixture_score", 0.0) or 0.0)),
+        "min_complexity_score": float(separation_diag.get("gates", {}).get("min_mixture_score", 0.0)),
+        "complexity_source": separation_diag.get("complexity_score_source", "unknown"),
+        "decision": "ran" if separation_diag.get("ran", False) else "skipped",
+    }
+    if pipeline_logger and hasattr(pipeline_logger, "log_event"):
+        try:
+            pipeline_logger.log_event("stage_b", "separation_decision", payload=separation_decision)
+        except Exception:
+            logger.debug("Failed to log separation_decision", exc_info=True)
+
     whitelist = getattr(b_conf, "active_stems", None)
     if whitelist is not None:
         filtered_stems = {}
@@ -2071,6 +2111,7 @@ def extract_features(
         "polyphonic_context": bool(polyphonic_context),
         "detectors_initialized": list(detectors.keys()),
         "separation": separation_diag,
+        "separation_decision": separation_decision,
         "harmonic_masking": {
             "enabled": bool(harmonic_cfg.get("enabled", False)),
             "applied": bool(harmonic_mask_applied),
