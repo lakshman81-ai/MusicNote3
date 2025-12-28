@@ -122,6 +122,7 @@ def test_poly_min_duration_override_respected():
     cfg.stage_c.segmentation_method = {"method": "threshold"}
     cfg.stage_c.confidence_threshold = 0.05
     cfg.stage_c.confidence_hysteresis = {"start": 0.05, "end": 0.05}
+    cfg.stage_c.polyphonic_min_duration_floor_ms = 30.0
     cfg.stage_c.min_note_duration_ms = 80.0
     cfg.stage_c.min_note_duration_ms_poly = 30.0
 
@@ -135,3 +136,65 @@ def test_poly_min_duration_override_respected():
     assert len(notes) == 1
     voice_settings = analysis.diagnostics["stage_c"]["voice_settings"][0]
     assert pytest.approx(voice_settings["voice_min_note_dur_ms"], rel=1e-3) == 30.0
+
+
+def test_poly_gap_merge_bridges_medium_gaps():
+    cfg = PipelineConfig()
+    cfg.stage_c.segmentation_method = {"method": "threshold"}
+    cfg.stage_c.confidence_threshold = 0.05
+    cfg.stage_c.confidence_hysteresis = {"start": 0.05, "end": 0.05}
+    cfg.stage_c.post_merge = {"max_gap_ms": 50.0}
+    cfg.stage_c.quantize = {"enabled": False}
+
+    # Two 90ms notes with a 70ms gap -> should merge in poly profile
+    pitches = [0] * 3 + [440.0] * 9 + [0] * 7 + [440.0] * 9 + [0] * 3
+    stem = _build_timeline(pitches, poly=True)
+    meta = MetaData(audio_type=AudioType.POLYPHONIC)
+    analysis = AnalysisData(meta=meta, stem_timelines={"mix": stem})
+
+    notes = apply_theory(analysis, cfg)
+
+    assert len(notes) == 1
+    assert notes[0].midi_note == stem[3].midi
+
+
+def test_mono_respects_smaller_gap_merge_limit():
+    cfg = PipelineConfig()
+    cfg.stage_c.segmentation_method = {"method": "threshold"}
+    cfg.stage_c.confidence_threshold = 0.05
+    cfg.stage_c.confidence_hysteresis = {"start": 0.05, "end": 0.05}
+    cfg.stage_c.post_merge = {"max_gap_ms": 50.0}
+    cfg.stage_c.quantize = {"enabled": False}
+
+    pitches = [0] * 3 + [440.0] * 9 + [0] * 7 + [440.0] * 9 + [0] * 3
+    stem = _build_timeline(pitches, poly=False)
+    meta = MetaData(audio_type=AudioType.MONOPHONIC)
+    analysis = AnalysisData(meta=meta, stem_timelines={"mix": stem})
+
+    notes = apply_theory(analysis, cfg)
+
+    assert len(notes) == 2
+    assert {n.midi_note for n in notes} == {stem[3].midi}
+
+
+def test_poly_chord_snap_window_clamped():
+    cfg = PipelineConfig()
+    cfg.stage_c.segmentation_method = {"method": "threshold"}
+    cfg.stage_c.confidence_threshold = 0.05
+    cfg.stage_c.confidence_hysteresis = {"start": 0.05, "end": 0.05}
+    cfg.stage_c.chord_onset_snap_ms = 45.0
+    cfg.stage_c.quantize = {"enabled": False}
+
+    stem_a = _build_timeline([0] * 2 + [261.63] * 12, poly=True)  # start at 20ms
+    stem_b = _build_timeline([0] * 6 + [329.63] * 12, poly=True)  # start at 60ms
+
+    meta = MetaData(audio_type=AudioType.POLYPHONIC)
+    analysis = AnalysisData(meta=meta, stem_timelines={"mix": stem_a, "other": stem_b})
+
+    notes = apply_theory(analysis, cfg)
+    assert len(notes) == 2
+    notes = sorted(notes, key=lambda n: n.start_sec)
+    gap = notes[1].start_sec - notes[0].start_sec
+
+    # With clamp to <=35ms, 40ms-apart onsets should not snap together
+    assert gap > 0.035

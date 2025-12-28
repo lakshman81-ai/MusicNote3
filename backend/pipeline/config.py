@@ -310,6 +310,15 @@ class StageCConfig:
         default_factory=lambda: {"max_gap_ms": 100.0}
     )
 
+    # Polyphonic profile guardrails
+    polyphonic_profile_enabled: bool = True
+    polyphonic_min_duration_floor_ms: float = 80.0
+    polyphonic_release_frames: int = 4
+    polyphonic_gap_merge_floor_ms: float = 70.0
+    polyphonic_gap_merge_max_ms: float = 80.0
+    polyphonic_chord_snap_min_ms: float = 15.0
+    polyphonic_chord_snap_max_ms: float = 35.0
+
     # --- CONSOLIDATED FIX (L6 runner + stage_c.py dotted-path knobs) ---
     # stage_c.py reads:
     #   stage_c.chord_onset_snap_ms (default 25ms)
