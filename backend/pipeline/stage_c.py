@@ -915,6 +915,9 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
         "polyphonic_context_resolved": bool(poly_context),
     }
 
+    poly_profile_enabled = bool(resolve_val("polyphonic_profile_enabled", True))
+    poly_profile_active = bool(poly_profile_enabled and poly_context)
+
     if not stem_timelines:
         analysis_data.notes_before_quantization = []
         analysis_data.notes = []
@@ -939,11 +942,22 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
     accomp_conf = float(_get(config, "stage_c.polyphonic_confidence.accompaniment", poly_conf))
     conf_thr = base_conf
 
+    poly_min_floor_ms = float(resolve_val("polyphonic_min_duration_floor_ms", 80.0))
+    poly_release_frames = int(resolve_val("polyphonic_release_frames", 4))
+    poly_gap_merge_floor_ms = float(resolve_val("polyphonic_gap_merge_floor_ms", 70.0))
+    poly_gap_merge_max_ms = float(resolve_val("polyphonic_gap_merge_max_ms", 80.0))
+    poly_chord_snap_min_ms = float(resolve_val("polyphonic_chord_snap_min_ms", 15.0))
+    poly_chord_snap_max_ms = float(resolve_val("polyphonic_chord_snap_max_ms", 35.0))
+
     min_note_dur_ms = resolve_val("min_note_duration_ms", 50.0)
     min_note_dur_s = float(min_note_dur_ms) / 1000.0
 
     min_note_dur_ms_poly = resolve_val("min_note_duration_ms_poly", None)
     min_note_dur_s_poly = float(min_note_dur_ms_poly) / 1000.0 if min_note_dur_ms_poly is not None else None
+    if min_note_dur_s_poly is None:
+        min_note_dur_s_poly = min_note_dur_s
+    if poly_profile_active:
+        min_note_dur_s_poly = max(min_note_dur_s_poly, float(poly_min_floor_ms) / 1000.0)
     gap_tolerance_s = float(resolve_val("gap_tolerance_s", 0.05))
 
     min_db = float(_get(config, "stage_c.velocity_map.min_db", -40.0))
@@ -1156,6 +1170,13 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
                     if enable_polyphony and sub_idx > 0:
                         seg_cfg_local["use_repeated_note_splitter"] = False
 
+                    if poly_profile_active:
+                        try:
+                            rel_frames_cfg = int(seg_cfg_local.get("release_frames", seg_cfg.get("release_frames", 2)))
+                        except Exception:
+                            rel_frames_cfg = int(seg_cfg.get("release_frames", 2))
+                        seg_cfg_local["release_frames"] = max(int(poly_release_frames), int(rel_frames_cfg))
+
                     segs = _segment_monophonic(
                         timeline=sub_tl,
                         conf_thr=voice_conf_gate,
@@ -1254,6 +1275,9 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
         or 60.0
     )
     merge_gap_ms = float(min(max(merge_gap_ms, 0.0), 200.0))
+    if poly_profile_active:
+        merge_gap_ms = float(min(max(merge_gap_ms, poly_gap_merge_floor_ms), poly_gap_merge_max_ms))
+        snap_ms = float(min(max(snap_ms, poly_chord_snap_min_ms), poly_chord_snap_max_ms))
 
     gap_merges = 0
     chord_snaps = 0
