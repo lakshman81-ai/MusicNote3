@@ -22,6 +22,7 @@ Key fixes applied in this version:
   (aligns with backend.pipeline.transcribe design; fixes missing timeline/diagnostics bugs).
 - L5.* “freeze classic” fixed: previously wrote config.transcription_mode (wrong); now sets config.stage_b.transcription_mode.
 - Optional, friendly error messaging if soundfile/synth backend is missing, instead of crashing at import time.
+- Deterministic runs: use --pipeline-seed/--deterministic to seed the pipeline once per run, and --deterministic-torch to opt into torch.use_deterministic_algorithms(True). Set OMP_NUM_THREADS/MKL_NUM_THREADS in the environment to pin runner thread pools when needed.
 """
 
 from __future__ import annotations
@@ -46,6 +47,7 @@ from music21 import tempo, chord
 
 from backend.pipeline.config import PipelineConfig, InstrumentProfile
 from backend.pipeline.instrumentation import PipelineLogger
+from backend.pipeline.determinism import apply_determinism
 from backend.pipeline.models import (
     StageAOutput,
     MetaData,
@@ -717,10 +719,32 @@ def run_pipeline_on_audio(
 
 
 class BenchmarkSuite:
-    def __init__(self, output_dir: str):
+    def __init__(
+        self,
+        output_dir: str,
+        *,
+        pipeline_seed: Optional[int] = None,
+        deterministic: bool = False,
+        deterministic_torch: bool = False,
+    ):
         self.output_dir = output_dir
         self.results: List[Dict[str, Any]] = []
+        self.pipeline_seed = pipeline_seed
+        self.deterministic = deterministic or pipeline_seed is not None
+        self.deterministic_torch = deterministic_torch
         os.makedirs(output_dir, exist_ok=True)
+
+    def _apply_suite_determinism(self, config: PipelineConfig) -> PipelineConfig:
+        """Propagate suite-level determinism settings to a config and seed RNGs."""
+        if self.pipeline_seed is not None:
+            config.seed = self.pipeline_seed
+        if self.deterministic:
+            config.deterministic = True
+        if self.deterministic_torch:
+            config.deterministic_torch = True
+
+        apply_determinism(config)
+        return config
 
     def _deep_merge_config(self, target: Any, updates: Dict[str, Any], path: str = "config") -> None:
         """Recursively merge a dict of overrides into a PipelineConfig or nested dicts."""
@@ -776,7 +800,7 @@ class BenchmarkSuite:
         for src in merged_sources:
             self._deep_merge_config(config, src)
 
-        return config
+        return self._apply_suite_determinism(config)
 
     def _enforce_regression_thresholds(self, level: str, metrics: Dict[str, Any], profiling: Optional[Dict[str, Any]] = None):
         plan = accuracy_benchmark_plan()
@@ -811,7 +835,7 @@ class BenchmarkSuite:
         use_crepe_viterbi: bool = True,
         use_poly_dominant_segmentation: bool = False,
     ) -> PipelineConfig:
-        config = PipelineConfig()
+        config = self._apply_suite_determinism(PipelineConfig())
         try:
             config.stage_b.separation["enabled"] = True
             config.stage_b.separation["synthetic_model"] = True
@@ -1242,7 +1266,7 @@ class BenchmarkSuite:
         offset = 0.5
         gt = [(69, 0.0 + offset, 1.0 + offset)]
 
-        config = PipelineConfig()
+        config = self._apply_suite_determinism(PipelineConfig())
         try:
             config.stage_b.detectors["swiftf0"]["enabled"] = False
         except Exception:
@@ -1313,7 +1337,7 @@ class BenchmarkSuite:
             gt.append((m_, t + offset, t + d + offset))
             t += d
 
-        config = PipelineConfig()
+        config = self._apply_suite_determinism(PipelineConfig())
 
         # Disable pre-emphasis
         try:
@@ -1515,7 +1539,7 @@ class BenchmarkSuite:
             audio = audio[: int(max_duration * read_sr)]
             gt = [(m, s, min(e, max_duration)) for m, s, e in gt if s < max_duration]
 
-        config = PipelineConfig()
+        config = self._apply_suite_determinism(PipelineConfig())
         try:
             config.stage_b.separation["enabled"] = True
             config.stage_b.separation["model"] = "htdemucs"
@@ -1560,7 +1584,7 @@ class BenchmarkSuite:
             # Custom config tuned for synthetic sine waves (L4)
             # Standard piano/vocal detectors (SwiftF0) often fail on pure sines.
             # We rely on CREPE and YIN.
-            base_config = PipelineConfig()
+            base_config = self._apply_suite_determinism(PipelineConfig())
             base_config.stage_b.detectors["crepe"] = {
                 "enabled": True,
                 "model_capacity": "small",
@@ -1619,7 +1643,7 @@ class BenchmarkSuite:
         if audio.ndim > 1:
             audio = np.mean(audio, axis=1)
 
-        config = PipelineConfig()
+        config = self._apply_suite_determinism(PipelineConfig())
         # Avoid Demucs on synthetic benches
         try:
             config.stage_b.separation["enabled"] = False
@@ -1833,6 +1857,8 @@ class BenchmarkSuite:
             config = copy.deepcopy(PIANO_61KEY_CONFIG)
         else:
             config = PipelineConfig()
+
+        config = self._apply_suite_determinism(config)
 
         try:
             config.stage_b.separation["enabled"] = True
@@ -2100,7 +2126,10 @@ def resolve_levels(level_arg: str) -> List[str]:
 
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="Unified benchmark runner for the transcription pipeline.",
+        epilog="Tip: set OMP_NUM_THREADS/MKL_NUM_THREADS for runner-only CPU determinism.",
+    )
     parser.add_argument("--output", default=f"results/benchmark_{int(time.time())}")
     parser.add_argument(
         "--level",
@@ -2117,6 +2146,22 @@ def main():
         choices=["none", "piano_61key"],
         default="none",
         help="Use a specific config preset as the baseline (for L4/L5.2).",
+    )
+    parser.add_argument(
+        "--pipeline-seed",
+        type=int,
+        default=None,
+        help="Seed applied to the pipeline config to enforce deterministic RNG across runs.",
+    )
+    parser.add_argument(
+        "--deterministic",
+        action="store_true",
+        help="Force deterministic pipeline setup even without a seed value.",
+    )
+    parser.add_argument(
+        "--deterministic-torch",
+        action="store_true",
+        help="Enable torch.use_deterministic_algorithms(True); may reduce performance.",
     )
     args = parser.parse_args()
 
@@ -2138,7 +2183,20 @@ def main():
         logger.error(str(exc))
         sys.exit(1)
 
-    runner = BenchmarkSuite(args.output)
+    if args.pipeline_seed is not None or args.deterministic or args.deterministic_torch:
+        logger.info(
+            "Deterministic mode enabled (seed=%s, deterministic_torch=%s). "
+            "Consider setting OMP_NUM_THREADS/MKL_NUM_THREADS to limit thread jitter.",
+            args.pipeline_seed,
+            args.deterministic_torch,
+        )
+
+    runner = BenchmarkSuite(
+        args.output,
+        pipeline_seed=args.pipeline_seed,
+        deterministic=args.deterministic,
+        deterministic_torch=args.deterministic_torch,
+    )
     to_run = resolve_levels(args.level)
     use_preset = (args.preset == "piano_61key")
 

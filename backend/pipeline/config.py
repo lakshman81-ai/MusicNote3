@@ -437,6 +437,8 @@ class InstrumentProfile:
 class PipelineConfig:
     device: str = "cpu"  # "cpu" | "cuda" | "mps"
     seed: Optional[int] = None  # deterministic runs when set
+    deterministic: bool = False  # force deterministic behavior even without a seed
+    deterministic_torch: bool = False  # gate torch.use_deterministic_algorithms(True)
     instrument_override: Optional[str] = None  # e.g. "bass_guitar", "guitar_distorted"
     stage_a: StageAConfig = field(default_factory=StageAConfig)
     stage_b: StageBConfig = field(default_factory=StageBConfig)

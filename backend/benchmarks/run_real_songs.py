@@ -18,6 +18,11 @@ If no ``--song`` argument is provided, both songs are processed.
 Note: This script assumes that ground truth note lists live in
 ``ground_truth/<song>_gt.json`` and synthesizes the audio itself.  It
 does not rely on external MIDI or audio files.
+
+Determinism: pass ``--pipeline-seed``/``--deterministic`` to seed the pipeline
+once per run, and ``--deterministic-torch`` to opt into torch deterministic
+algorithms (may reduce throughput). For runner-only CPU determinism, set
+``OMP_NUM_THREADS``/``MKL_NUM_THREADS`` in the environment.
 """
 
 from __future__ import annotations
@@ -32,6 +37,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 from backend.pipeline.config import PipelineConfig
+from backend.pipeline.determinism import apply_determinism
 from backend.pipeline.models import (
     StageAOutput,
     MetaData,
@@ -83,6 +89,9 @@ def run_song(
     song: str,
     max_duration: Optional[float] = None,
     config: Optional[PipelineConfig] = None,
+    pipeline_seed: Optional[int] = None,
+    deterministic: bool = False,
+    deterministic_torch: bool = False,
 ) -> Dict[str, Any]:
     gt = load_ground_truth(song)
 
@@ -102,6 +111,15 @@ def run_song(
         config = copy.deepcopy(config)
     else:
         config = PipelineConfig()
+
+    if pipeline_seed is not None:
+        config.seed = pipeline_seed
+    if deterministic or pipeline_seed is not None:
+        config.deterministic = True
+    if deterministic_torch:
+        config.deterministic_torch = True
+
+    apply_determinism(config)
 
     # disable separation for synthetic audio
     config.stage_b.separation['enabled'] = False
@@ -167,8 +185,27 @@ def run_song(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run real songs benchmark")
+    parser = argparse.ArgumentParser(
+        description="Run real songs benchmark",
+        epilog="Tip: set OMP_NUM_THREADS/MKL_NUM_THREADS for runner-only CPU determinism.",
+    )
     parser.add_argument('--song', type=str, default='all', help='Song name: happy_birthday, old_macdonald, or all')
+    parser.add_argument(
+        '--pipeline-seed',
+        type=int,
+        default=None,
+        help='Seed applied to the pipeline config to lock RNG for reproducible runs.',
+    )
+    parser.add_argument(
+        '--deterministic',
+        action='store_true',
+        help='Force deterministic setup even when no seed is provided.',
+    )
+    parser.add_argument(
+        '--deterministic-torch',
+        action='store_true',
+        help='Enable torch deterministic algorithms (may slow benchmarks).',
+    )
     args = parser.parse_args()
     songs = []
     if args.song in ('happy_birthday', 'old_macdonald'):
@@ -181,7 +218,12 @@ def main() -> None:
     os.makedirs(run_dir, exist_ok=True)
     summary: List[Dict[str, Any]] = []
     for song in songs:
-        res = run_song(song)
+        res = run_song(
+            song,
+            pipeline_seed=args.pipeline_seed,
+            deterministic=args.deterministic or args.pipeline_seed is not None,
+            deterministic_torch=args.deterministic_torch,
+        )
         summary.append({k: res[k] for k in ['song','note_f1','onset_mae_ms','offset_mae_ms','predicted_notes','gt_notes']})
         # Save per-song artifacts
         with open(os.path.join(run_dir, f'{song}_predicted_notes.json'), 'w', encoding='utf-8') as f:
