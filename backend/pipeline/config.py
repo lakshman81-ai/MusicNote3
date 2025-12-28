@@ -9,7 +9,12 @@ from dataclasses import dataclass, field
 @dataclass
 class StageAConfig:
     target_sample_rate: int = 44100
-    channel_handling: str = "mono_sum"  # "mono_sum", "left_only", "right_only"
+    # "auto" preserves stereo when the mixture looks polyphonic/complex, otherwise falls back to mono_sum.
+    # Other options: "mono_sum", "left_only", "right_only", "stereo"
+    channel_handling: str = "auto"
+    # Thresholds that govern when stereo is preserved in auto mode
+    polyphony_keep_stereo_threshold: float = 0.35
+    mixture_keep_stereo_threshold: float = 0.35
 
     # Preprocessing flags/dicts (updated for 61-key flexibility)
     dc_offset_removal: Union[bool, Dict[str, Any]] = True

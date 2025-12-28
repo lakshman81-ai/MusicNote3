@@ -119,7 +119,7 @@ def detect_audio_type(audio: np.ndarray, sr: int, poly_flatness: float = 0.4) ->
     return AudioType.MONOPHONIC
 
 
-def _load_audio_fallback(path: str, target_sr: int) -> Tuple[np.ndarray, int]:
+def _load_audio_fallback(path: str, target_sr: int, preserve_channels: bool = False) -> Tuple[np.ndarray, int]:
     """Fallback loader using scipy if librosa is missing."""
     try:
         sr, audio = scipy.io.wavfile.read(path)
@@ -134,8 +134,8 @@ def _load_audio_fallback(path: str, target_sr: int) -> Tuple[np.ndarray, int]:
     elif audio.dtype == np.uint8:
         audio = (audio.astype(np.float32) - 128.0) / 128.0
 
-    # Convert to mono
-    if audio.ndim > 1:
+    # Convert to mono unless caller explicitly wants channels preserved
+    if audio.ndim > 1 and not preserve_channels:
         audio = np.mean(audio, axis=1)
 
     # Resample if needed (simple integer factors only or scipy.signal.resample)
@@ -412,7 +412,7 @@ def load_and_preprocess(
     Stage A main entry point.
 
     1. Load audio (resample to target_sr).
-    2. Convert to mono.
+    2. Optionally convert to mono (policy-driven).
     3. Trim silence.
     4. Normalize loudness.
     5. Estimate noise floor.
@@ -462,12 +462,12 @@ def load_and_preprocess(
                 audio, sr = librosa.load(
                     audio_path,
                     sr=target_sr,
-                    mono=True,
+                    mono=False,  # keep channels; downmix is handled below
                     offset=max(0.0, float(start_offset or 0.0)),
                     duration=max_duration,
                 )
         else:
-            audio, sr = _load_audio_fallback(audio_path, target_sr)
+            audio, sr = _load_audio_fallback(audio_path, target_sr, preserve_channels=True)
             if start_offset or max_duration:
                 offset_samples = int(max(0.0, float(start_offset or 0.0)) * sr)
                 end = int(offset_samples + (max_duration * sr if max_duration else len(audio)))
@@ -478,14 +478,27 @@ def load_and_preprocess(
     if len(audio) == 0:
         raise ValueError("Audio too short (empty)")
 
-    original_duration = float(len(audio)) / float(sr)
+    # Normalize channel layout to [channels, samples]
+    if audio.ndim == 1:
+        audio_multi = audio[np.newaxis, :]
+    else:
+        audio_multi = audio
+
+    original_n_channels = int(audio_multi.shape[0])
+    original_duration = float(audio_multi.shape[-1]) / float(sr)
+
+    def _apply_channelwise(arr: np.ndarray, fn) -> np.ndarray:
+        """Apply a single-channel transform to each channel independently."""
+        if arr.ndim == 1:
+            return fn(arr)
+        return np.stack([fn(ch) for ch in arr], axis=0)
 
     # 1b. Signal conditioning (DC Offset, HPF, Limiter)
 
     # DC offset removal
     dc_conf = getattr(a_conf, "dc_offset_removal", False)
     if dc_conf is True or (isinstance(dc_conf, dict) and dc_conf.get("enabled", False)):
-        audio = _remove_dc_offset(audio)
+        audio_multi = _apply_channelwise(audio_multi, _remove_dc_offset)
 
     # High-pass filter
     hpf_cfg = getattr(a_conf, "high_pass_filter", None) or {}
@@ -501,16 +514,22 @@ def load_and_preprocess(
     hpf_order = int(hpf_cfg.get("order", 4))
 
     if hpf_enabled:
-        audio = _high_pass(audio, sr=int(sr), cutoff_hz=hpf_cutoff, order=hpf_order)
+        audio_multi = _apply_channelwise(
+            audio_multi,
+            lambda sig: _high_pass(sig, sr=int(sr), cutoff_hz=hpf_cutoff, order=hpf_order)
+        )
 
     # Peak limiter
     lim = getattr(a_conf, "peak_limiter", {}) or {}
     if lim.get("enabled", False):
-        audio = _soft_limiter(
-            audio,
-            ceiling_db=float(lim.get("ceiling_db", -1.0)),
-            mode=str(lim.get("mode", "tanh")).lower(),
-            drive=float(lim.get("drive", 2.5)),
+        audio_multi = _apply_channelwise(
+            audio_multi,
+            lambda sig: _soft_limiter(
+                sig,
+                ceiling_db=float(lim.get("ceiling_db", -1.0)),
+                mode=str(lim.get("mode", "tanh")).lower(),
+                drive=float(lim.get("drive", 2.5)),
+            ),
         )
 
     # Diagnostics logging
@@ -526,12 +545,72 @@ def load_and_preprocess(
     # 1c. Transient Emphasis (Optional)
     tpe_conf = a_conf.transient_pre_emphasis
     if tpe_conf.get("enabled", True):
-        audio = warped_linear_prediction(audio, sr=sr, pre_emphasis=float(tpe_conf.get("alpha", 0.97)))
+        audio_multi = _apply_channelwise(
+            audio_multi,
+            lambda sig: warped_linear_prediction(sig, sr=sr, pre_emphasis=float(tpe_conf.get("alpha", 0.97)))
+        )
 
+    def _shared_trim(audio_in: np.ndarray, reason: str) -> Tuple[np.ndarray, Dict[str, Any]]:
+        guide = np.mean(audio_in, axis=0)
+        peak = float(np.max(np.abs(guide)) + 1e-9)
+        thresh = peak * (10 ** (-trim_db / 20.0))
+        mask = np.where(np.abs(guide) > thresh)[0]
+        if mask.size == 0:
+            return audio_in, {"trim_method": "shared_trim", "fallback_reason": f"{reason}_no_mask", "trim_start": 0, "trim_end": audio_in.shape[-1], "guide_rms": float(np.sqrt(np.mean(guide ** 2)))}
+        start = max(0, int(mask[0] - hop_length))
+        end = min(guide.shape[-1], int(mask[-1] + hop_length))
+        if end <= start:
+            return audio_in, {"trim_method": "shared_trim", "fallback_reason": f"{reason}_invalid_bounds", "trim_start": 0, "trim_end": audio_in.shape[-1], "guide_rms": float(np.sqrt(np.mean(guide ** 2)))}
+        min_len = int(max(1, 0.1 * float(sr)))  # 100ms minimum retention
+        if (end - start) < min_len:
+            return audio_in, {"trim_method": "shared_trim", "fallback_reason": f"{reason}_min_len_guard", "trim_start": 0, "trim_end": audio_in.shape[-1], "guide_rms": float(np.sqrt(np.mean(guide ** 2)))}
+        return audio_in[:, start:end], {
+            "trim_method": "shared_trim",
+            "fallback_reason": reason,
+            "trim_start": int(start),
+            "trim_end": int(end),
+            "guide_rms": float(np.sqrt(np.mean(guide ** 2))),
+        }
+
+    trim_diag: Dict[str, Any] = {}
     # 2. Trim Silence
     # Allow strict override from config/overrides
     if a_conf.silence_trimming.get("enabled", True):
-        audio = _trim_silence(audio, top_db=trim_db, frame_length=window_size, hop_length=hop_length)
+        if librosa and audio_multi.ndim > 1:
+            guide = np.mean(audio_multi, axis=0)
+            try:
+                _, idx = librosa.effects.trim(guide, top_db=trim_db, frame_length=window_size, hop_length=hop_length)
+                start = int(max(0, min(idx[0], audio_multi.shape[-1])))
+                end = int(max(start + 1, min(idx[1], audio_multi.shape[-1])))
+                audio_multi = audio_multi[:, start:end]
+                trim_diag = {
+                    "trim_method": "librosa",
+                    "trim_start": start,
+                    "trim_end": end,
+                    "guide_rms": float(np.sqrt(np.mean(guide ** 2))),
+                }
+            except Exception:
+                audio_multi, trim_diag = _shared_trim(audio_multi, "librosa_failed")
+        elif audio_multi.ndim > 1:
+            audio_multi, trim_diag = _shared_trim(audio_multi, "no_librosa")
+        else:
+            before_len = audio_multi.shape[-1]
+            audio_multi = _trim_silence(audio_multi, top_db=trim_db, frame_length=window_size, hop_length=hop_length)
+            trim_diag = {
+                "trim_method": "mono_trim",
+                "trim_start": 0,
+                "trim_end": int(audio_multi.shape[-1]),
+                "guide_rms": float(np.sqrt(np.mean(audio_multi ** 2))),
+                "fallback_reason": "mono_path" if audio_multi.shape[-1] != before_len else "none",
+            }
+    else:
+        trim_diag = {
+            "trim_method": "disabled",
+            "trim_start": 0,
+            "trim_end": int(audio_multi.shape[-1]),
+            "guide_rms": float(np.sqrt(np.mean(np.mean(audio_multi, axis=0) ** 2))),
+            "fallback_reason": "disabled",
+        }
 
     # 3. Loudness Normalization
     gain_db = 0.0
@@ -539,13 +618,25 @@ def load_and_preprocess(
     loudness_after = None
     loudness_measurement = "unmeasured"
     if a_conf.loudness_normalization.get("enabled", True):
-        audio, gain_db, loudness_before, loudness_after, loudness_measurement = _normalize_loudness(audio, sr, target_lufs)
+        mono_ref = np.mean(audio_multi, axis=0)
+        mono_norm, gain_db, loudness_before, loudness_after, loudness_measurement = _normalize_loudness(mono_ref, sr, target_lufs)
+        gain_lin = 10.0 ** (gain_db / 20.0)
+        # Peak guard to avoid clipping after gain
+        peak_before = float(np.max(np.abs(audio_multi)))
+        if peak_before > 0:
+            peak_headroom = 0.98
+            peak_guard = peak_headroom / peak_before
+            gain_lin = min(gain_lin, peak_guard)
+        audio_multi = audio_multi * gain_lin if audio_multi.ndim > 1 else mono_norm
+        trim_diag["gain_peak_before"] = peak_before
+        trim_diag["gain_peak_after"] = float(np.max(np.abs(audio_multi))) if audio_multi.size else 0.0
+        trim_diag["gain_headroom_target"] = 0.98
     else:
-        loudness_before, loudness_measurement = _measure_loudness(audio, sr)
+        loudness_before, loudness_measurement = _measure_loudness(np.mean(audio_multi, axis=0), sr)
         loudness_after = loudness_before
 
     # 4. Noise Floor
-    nf_rms, nf_db = _estimate_noise_floor(audio, percentile=a_conf.noise_floor_estimation.get("percentile", 30), hop_length=hop_length)
+    nf_rms, nf_db = _estimate_noise_floor(np.mean(audio_multi, axis=0), percentile=a_conf.noise_floor_estimation.get("percentile", 30), hop_length=hop_length)
 
     # 5. Optional tempo / beat detection (lightweight, single pass)
     bpm_cfg = getattr(a_conf, "bpm_detection", None) or {}
@@ -566,11 +657,11 @@ def load_and_preprocess(
     # We set a gate: e.g., < 6.0s -> skip (too short)
     # Also if user explicitly disabled it.
 
-    is_too_short = (len(audio) / sr) < 6.0 # explicit 6s gate per requirements
+    is_too_short = (audio_multi.shape[-1] / sr) < 6.0 # explicit 6s gate per requirements
 
     if bpm_enabled and not is_too_short:
         tempo_bpm, beat_times = detect_tempo_and_beats(
-            audio,
+            np.mean(audio_multi, axis=0),
             sr=target_sr,
             enabled=True,
             tightness=bpm_tightness,
@@ -617,28 +708,74 @@ def load_and_preprocess(
         })
 
     # 6. Detect texture (mono / poly)
-    detected_type = detect_audio_type(audio, sr)
+    mono_for_analysis = np.mean(audio_multi, axis=0)
+    detected_type = detect_audio_type(mono_for_analysis, sr)
 
     # 6b. Estimate mixture complexity to inform Stage B separation gating
-    mix_complexity = _compute_mixture_complexity(audio, sr)
+    mix_complexity = _compute_mixture_complexity(mono_for_analysis, sr)
     if pipeline_logger:
         pipeline_logger.log_event("stage_a", "mixture_complexity", payload=mix_complexity)
 
+    # 6c. Resolve channel handling policy
+    # Auto policy: keep stereo when mix complexity or detected polyphony is high; otherwise fold to mono.
+    ch_policy = str(getattr(a_conf, "channel_handling", "auto") or "auto").lower()
+    poly_thresh = float(getattr(a_conf, "polyphony_keep_stereo_threshold", 0.35) or 0.35)
+    mix_thresh = float(getattr(a_conf, "mixture_keep_stereo_threshold", 0.35) or 0.35)
+    poly_gate = float(mix_complexity.get("score", 0.0) or 0.0) >= mix_thresh or float(mix_complexity.get("polyphony", 0.0) or 0.0) >= poly_thresh or detected_type != AudioType.MONOPHONIC
+    keep_stereo = False
+    channel_map = "preserved"
+    if ch_policy in ("stereo", "stereo_keep"):
+        keep_stereo = original_n_channels >= 2
+    elif ch_policy == "auto":
+        keep_stereo = original_n_channels >= 2 and poly_gate
+    elif ch_policy in ("mono", "mono_sum"):
+        keep_stereo = False
+    elif ch_policy == "left_only":
+        audio_multi = audio_multi[:1, :]
+        keep_stereo = False
+        channel_map = "left_only"
+    elif ch_policy == "right_only" and audio_multi.shape[0] > 1:
+        audio_multi = audio_multi[1:2, :]
+        keep_stereo = False
+        channel_map = "right_only"
+
+    downmix_applied = False
+    channel_map = channel_map if keep_stereo else "mono_sum"
+    if ch_policy == "left_only":
+        channel_map = "left_only"
+    elif ch_policy == "right_only":
+        channel_map = "right_only"
+    if not keep_stereo and audio_multi.shape[0] > 1:
+        audio_multi = np.mean(audio_multi, axis=0, keepdims=True)
+        downmix_applied = True
+    elif keep_stereo and audio_multi.shape[0] > 2:
+        # Limit to stereo for downstream separators that expect two channels.
+        audio_multi = audio_multi[:2, :]
+        channel_map = "stereo_trimmed"
+
     # 7. Populate Metadata & Output
     # Basic MetaData
+    processed_channels = int(audio_multi.shape[0])
+    duration_sec = float(audio_multi.shape[-1]) / float(sr)
+    mix_audio = audio_multi[0] if processed_channels == 1 else np.transpose(audio_multi)
     meta = MetaData(
         audio_path=audio_path,
         sample_rate=sr,
         target_sr=target_sr,
-        duration_sec=float(len(audio)) / float(sr),
+        duration_sec=duration_sec,
         original_duration_sec=float(original_duration),
-        n_channels=1, # we forced mono
+        n_channels=processed_channels,
+        original_n_channels=original_n_channels,
+        processed_n_channels=processed_channels,
+        downmix_applied=bool(downmix_applied),
+        channel_handling_policy=ch_policy,
+        channel_map=channel_map,
         lufs=target_lufs, # assumed target
         loudness_measurement=loudness_measurement,
         loudness_or_rms=loudness_before if loudness_before is not None else -float("inf"),
         loudness_post_norm=loudness_after if loudness_after is not None else -float("inf"),
         normalization_gain_db=gain_db,
-        rms_db=20.0 * np.log10(np.sqrt(np.mean(audio**2)) + 1e-9),
+        rms_db=20.0 * np.log10(np.sqrt(np.mean(mono_for_analysis**2)) + 1e-9),
         noise_floor_rms=nf_rms,
         noise_floor_db=nf_db,
         pipeline_version="2.0.0",
@@ -663,7 +800,27 @@ def load_and_preprocess(
     )
 
     # Output only the mix stem. Separation is handled in Stage B.
-    stems = {"mix": Stem(audio=audio, sr=sr, type="mix")}
+    stems = {"mix": Stem(audio=mix_audio.astype(np.float32), sr=sr, type="mix")}
+
+    diag_payload = {
+        "bpm": bpm_diag,
+        "mixture_complexity": mix_complexity,
+        "trim": trim_diag,
+        "gain": {
+            "gain_db": float(gain_db),
+            "peak_before": float(trim_diag.get("gain_peak_before", 0.0)),
+            "peak_after": float(np.max(np.abs(audio_multi))) if audio_multi.size else 0.0,
+        },
+        "channel_handling": {
+            "policy": ch_policy,
+            "keep_stereo": bool(keep_stereo),
+            "polyphony_estimate": float(mix_complexity.get("polyphony", 0.0)),
+            "mixture_score": float(mix_complexity.get("score", 0.0)),
+            "poly_threshold": poly_thresh,
+            "mix_threshold": mix_thresh,
+            "channel_map": channel_map,
+        }
+    }
 
     return StageAOutput(
         stems=stems,
@@ -672,5 +829,5 @@ def load_and_preprocess(
         noise_floor_rms=nf_rms,
         noise_floor_db=nf_db,
         beats=beat_times,
-        diagnostics={"bpm": bpm_diag, "mixture_complexity": mix_complexity}
+        diagnostics=diag_payload
     )
