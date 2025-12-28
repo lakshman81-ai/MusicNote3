@@ -8,6 +8,8 @@ import itertools
 import numpy as np
 from dataclasses import asdict
 
+os.environ.setdefault("PYTHONHASHSEED", "0")
+
 # Ensure we can import backend
 sys.path.append(os.getcwd())
 
@@ -30,6 +32,23 @@ except ImportError as e:
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("l6_debug_runner")
+
+
+def _seed_everything(seed: int = 123):
+    import random
+    random.seed(seed)
+    np.random.seed(seed)
+    try:
+        import torch
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    except Exception:
+        pass
+
+
+_seed_everything()
 
 REPORTS_DIR = "reports"
 SNAPSHOTS_DIR = os.path.join(REPORTS_DIR, "snapshots")
@@ -119,7 +138,9 @@ def run_baseline(run_id):
     gt = BenchmarkSuite._score_to_gt(score, parts=["Lead"])
 
     wav_path = os.path.join(SNAPSHOTS_DIR, run_id, "L6_synthetic_pop_song.wav")
-    midi_to_wav_synth(score, wav_path, sr=sr, use_enhanced_synth=True)
+    synth_profile = os.environ.get("L6_SYNTH_PROFILE", "legacy")
+    use_enhanced = synth_profile == "enhanced"
+    midi_to_wav_synth(score, wav_path, sr=sr, use_enhanced_synth=use_enhanced)
 
     config = get_l6_config()
 
@@ -152,7 +173,7 @@ def run_baseline(run_id):
         "stage_b.separation.enabled": True,
         "stage_b.separation.synthetic_model": True,
         "stage_b.detectors.fmin_override": 180.0,
-        "synth_profile": "enhanced",
+        "synth_profile": synth_profile,
     }
     diagnostics["runner_overrides"] = runner_overrides
 
@@ -229,7 +250,7 @@ def run_salvage(run_id, wav_path, gt, baseline_metrics):
 
     salvage_runs = []
 
-    def _eval_cfg(cfg, label):
+    def _eval_cfg(cfg, label, overrides):
         try:
             res = transcribe(wav_path, config=cfg)
             pred_notes = res.analysis_data.notes
@@ -242,11 +263,13 @@ def run_salvage(run_id, wav_path, gt, baseline_metrics):
                 "note_f1": f1,
                 "onset_mae_ms": onset_mae * 1000 if onset_mae is not None else None,
                 "note_count": len(pred_list),
+                "metrics": symptoms,
+                "overrides_applied": overrides,
                 **symptoms,
                 "error": None,
             }
         except Exception as e:
-            return {"label": label, "error": str(e)}
+            return {"label": label, "error": str(e), "overrides_applied": overrides}
 
     # Salvage A: recall boost
     cfg_a = get_l6_config()
@@ -259,7 +282,7 @@ def run_salvage(run_id, wav_path, gt, baseline_metrics):
         cfg_a.stage_c.min_note_duration_ms = cfg_a.stage_c.min_note_duration_ms + 10.0
     except Exception:
         pass
-    salvage_runs.append(_eval_cfg(cfg_a, "salvage_recall"))
+    salvage_runs.append(_eval_cfg(cfg_a, "salvage_recall", {"voicing_delta": -0.1, "min_note_ms_delta": +10}))
 
     # Salvage B: precision boost
     cfg_b = get_l6_config()
@@ -275,7 +298,7 @@ def run_salvage(run_id, wav_path, gt, baseline_metrics):
         cfg_b.stage_c.chord_onset_snap_ms = 15.0
     except Exception:
         pass
-    salvage_runs.append(_eval_cfg(cfg_b, "salvage_precision"))
+    salvage_runs.append(_eval_cfg(cfg_b, "salvage_precision", {"voicing_delta": +0.05, "max_gap_ms": 40.0, "chord_onset_snap_ms": 15.0}))
 
     # Log triggers
     for r in salvage_runs:

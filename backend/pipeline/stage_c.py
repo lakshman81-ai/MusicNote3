@@ -1028,6 +1028,11 @@ def apply_theory(analysis_data: AnalysisData, config: Any = None) -> List[NoteEv
             if not timeline or len(timeline) < 2:
                 continue
 
+            # Timebase sanity: ensure timeline times are strictly increasing
+            times = [fp.time for fp in timeline]
+            if any((times[i] <= times[i - 1]) for i in range(1, len(times))):
+                analysis_data.diagnostics.setdefault("health_flags", []).append("timebase_mismatch")
+
             if poly_filter_mode == "skyline_top_voice":
                 new_tl: List[FramePitch] = []
                 skyline_conf_thr = max(0.05, min(conf_thr * 0.5, 0.2))
