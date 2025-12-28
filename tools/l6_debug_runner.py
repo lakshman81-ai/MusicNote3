@@ -4,6 +4,7 @@ import sys
 import json
 import uuid
 import logging
+import argparse
 import itertools
 import numpy as np
 from dataclasses import asdict
@@ -104,18 +105,24 @@ def get_l6_config():
     except Exception:
         pass
     
-    # Fix RuntimeError in fallback chain
-    try:
-        config.stage_b.onsets_and_frames["enabled"] = True
-    except Exception:
-        pass
+    # Fix RuntimeError in fallback chain (Robust)
+    oaf = getattr(config.stage_b, "onsets_and_frames", None)
+    if not isinstance(oaf, dict):
+        logger.warning("stage_b.onsets_and_frames missing/invalid; reinitializing to dict")
+        oaf = {}
+
+    oaf.setdefault("enabled", False)
+    # Force enable for L6 runner to ensure fallback availability
+    oaf["enabled"] = True
+
+    config.stage_b.onsets_and_frames = oaf
         
     return config
 
-def run_baseline(run_id):
-    logger.info("Running Baseline L6...")
+def run_baseline(run_id, duration_sec=30.0):
+    logger.info(f"Running Baseline L6 (duration={duration_sec}s)...")
     sr = 22050
-    score = create_pop_song_base(duration_sec=30.0, tempo_bpm=110, seed=0)
+    score = create_pop_song_base(duration_sec=duration_sec, tempo_bpm=110, seed=0)
     gt = BenchmarkSuite._score_to_gt(score, parts=["Lead"])
 
     wav_path = os.path.join(SNAPSHOTS_DIR, run_id, "L6_synthetic_pop_song.wav")
@@ -153,6 +160,7 @@ def run_baseline(run_id):
         "stage_b.separation.synthetic_model": True,
         "stage_b.detectors.fmin_override": 180.0,
         "synth_profile": "enhanced",
+        "stage_b.onsets_and_frames.enabled": True,
     }
     diagnostics["runner_overrides"] = runner_overrides
 
@@ -405,17 +413,33 @@ def generate_reports(baseline_metrics, sweep_results, diagnostics, salvage_resul
         f.write("skipped diff\n")
 
 def main():
+    parser = argparse.ArgumentParser(description="L6 Debug Runner")
+    parser.add_argument("--duration-sec", type=float, default=30.0, help="Duration of the synthetic song in seconds")
+    parser.add_argument("--no-sweep", action="store_true", help="Skip the parameter sweep")
+    parser.add_argument("--fast", action="store_true", help="Fast mode: duration=15s, no sweep")
+    args = parser.parse_args()
+
+    duration = args.duration_sec
+    run_sweep_flag = not args.no_sweep
+
+    if args.fast:
+        duration = 15.0
+        run_sweep_flag = False
+
     run_id = uuid.uuid4().hex[:8]
     ensure_dirs(run_id)
 
-    metrics, gt, wav_path, diagnostics = run_baseline(run_id)
+    metrics, gt, wav_path, diagnostics = run_baseline(run_id, duration_sec=duration)
     salvage_results = run_salvage(run_id, wav_path, gt, metrics)
 
-    if wav_path and os.path.exists(wav_path):
+    if run_sweep_flag and wav_path and os.path.exists(wav_path):
         sweep_results = run_sweep(run_id, wav_path, gt)
     else:
         sweep_results = []
-        logger.error("WAV generation failed, skipping sweep.")
+        if not run_sweep_flag:
+            logger.info("Sweep skipped via arguments.")
+        else:
+            logger.error("WAV generation failed, skipping sweep.")
 
     generate_reports(metrics, sweep_results, diagnostics, salvage_results)
 
