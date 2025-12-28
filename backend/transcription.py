@@ -11,6 +11,7 @@ from .pipeline.stage_a import load_and_preprocess
 from .pipeline.stage_b import extract_features
 from .pipeline.stage_c import apply_theory
 from .pipeline.stage_d import quantize_and_render
+from .pipeline.determinism import apply_determinism
 from .pipeline.models import AnalysisData, TranscriptionResult, MetaData, AudioType, FramePitch
 from .pipeline.validation import validate_invariants, dump_resolved_config
 
@@ -53,6 +54,17 @@ def transcribe_audio_pipeline(
     from .pipeline.config import PipelineConfig
 
     pipeline_conf = PipelineConfig()
+    if "seed" in kwargs:
+        pipeline_conf.seed = kwargs["seed"]
+    if "deterministic" in kwargs:
+        pipeline_conf.deterministic = bool(kwargs["deterministic"])
+    if "deterministic_torch" in kwargs:
+        pipeline_conf.deterministic_torch = bool(kwargs["deterministic_torch"])
+
+    if pipeline_conf.seed is not None:
+        pipeline_conf.deterministic = True
+
+    apply_determinism(pipeline_conf)
 
     # Stage A (audio front end)
     if target_sample_rate is not None:

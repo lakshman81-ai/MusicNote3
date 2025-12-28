@@ -360,6 +360,11 @@ def main() -> int:
     ap.add_argument("--tag", default="l6_debug", help="Run tag")
     ap.add_argument("--device", default="cpu", help="Device (cpu/cuda/mps)")
     ap.add_argument("--seed", type=int, default=123, help="Determinism seed")
+    ap.add_argument(
+        "--deterministic-torch",
+        action="store_true",
+        help="Enable torch deterministic algorithms for the pipeline runs.",
+    )
     ap.add_argument("--max-combos", type=int, default=9, help="Max sweep combinations to run (cap)")
     ap.add_argument("--duration-sec", type=float, default=60.0, help="Synth duration")
     ap.add_argument("--tempo-bpm", type=float, default=110.0, help="Synth tempo")
@@ -396,7 +401,12 @@ def main() -> int:
     # ---- Generate L6 audio + GT ----
     sr = 22050
     score = create_pop_song_base(duration_sec=float(args.duration_sec), tempo_bpm=float(args.tempo_bpm), seed=0)
-    suite = BenchmarkSuite(output_dir=run_dir)
+    suite = BenchmarkSuite(
+        output_dir=run_dir,
+        pipeline_seed=args.seed,
+        deterministic=True,
+        deterministic_torch=args.deterministic_torch,
+    )
 
     gt = suite._score_to_gt(score, parts=["Lead"])
     if not gt:
@@ -407,7 +417,7 @@ def main() -> int:
     midi_to_wav_synth(score, wav_path, sr=sr)
 
     # ---- Baseline config (match L6 intent) ----
-    base_cfg = PipelineConfig()
+    base_cfg = suite._apply_suite_determinism(PipelineConfig())
 
     # ✅ FIX 1: FORCE L6 MODE (safety net)
     _force_l6_mode_on_cfg(base_cfg)
