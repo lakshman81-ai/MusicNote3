@@ -1726,6 +1726,10 @@ def extract_features(
         synthetic_like = bool(routing_features.get("synthetic_like", False))
         cqt_superres = bool(profile_special.get("cqt_superres", False)) or synthetic_like
 
+        # Patch 8: Explicit L7 profile support
+        if str(getattr(config, "bench_profile", "")).lower() == "l7_synth":
+            cqt_superres = True
+
         if cqt_superres and "cqt" in detector_cfgs:
             d = detector_cfgs["cqt"]
             if isinstance(d, dict):
@@ -1850,7 +1854,12 @@ def extract_features(
             harmonic_mask_applied = bool(synthetic)
 
     stems_for_processing = augmented_stems
-    polyphonic_context = polyphonic_context or (len(stems_for_processing) > 1) or bool(getattr(b_conf, "polyphonic_peeling", {}).get("force_on_mix", False))
+
+    # Patch 5: config-driven force switch
+    poly_peel_cfg = getattr(b_conf, "polyphonic_peeling", {}) or {}
+    force_poly = bool(poly_peel_cfg.get("force", False))
+
+    polyphonic_context = polyphonic_context or (len(stems_for_processing) > 1) or bool(poly_peel_cfg.get("force_on_mix", False)) or force_poly
 
     # Canonical n_frames aligned to framing logic (reduces mismatch churn)
     mix_stem_ref = stage_a_out.stems.get("mix") or next(iter(stage_a_out.stems.values()))
@@ -2106,13 +2115,15 @@ def extract_features(
         max_cands = int(poly_peel2.get("max_candidates_per_frame", tracker.max_tracks))
 
         # Relaxed voicing threshold for residual layers
-        base_thr = voicing_thr
-        layer_thr = max(0.05, base_thr * 0.4)
+        # Patch 6: Layer-aware relaxation
+        voicing_thr_main = voicing_thr
+        relax = float(poly_peel2.get("residual_voicing_relax", 0.10))
+        voicing_thr_resid = max(0.0, voicing_thr_main - relax)
 
         for i in range(max_frames):
             candidates: List[Tuple[float, float]] = []
             for layer_idx, (f0_arr, conf_arr) in enumerate(padded_layers):
-                thr = base_thr if layer_idx == 0 else layer_thr
+                thr = voicing_thr_main if layer_idx == 0 else voicing_thr_resid
                 f = float(f0_arr[i]) if i < len(f0_arr) else 0.0
                 c = float(conf_arr[i]) if i < len(conf_arr) else 0.0
                 if f > 0.0 and c >= thr:
