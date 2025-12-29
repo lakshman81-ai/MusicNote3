@@ -1,6 +1,19 @@
 import numpy as np
 import soundfile as sf
+import json
+import os
+import logging
+from typing import Tuple
 from music21 import stream, note, chord, tempo
+
+logger = logging.getLogger(__name__)
+
+# Try importing scipy.signal for high-quality resampling
+try:
+    import scipy.signal
+    SCIPY_AVAILABLE = True
+except ImportError:
+    SCIPY_AVAILABLE = False
 
 def _clamp_bpm(bpm: float, lo: float = 20.0, hi: float = 300.0, default: float = 120.0) -> float:
     try:
@@ -22,6 +35,77 @@ def _duration_ok(audio: np.ndarray, sr: int, expected_sec: float, tol: float = 0
     got = _duration_sec(audio, sr)
     exp = float(expected_sec)
     return exp > 0.0 and abs(got - exp) <= exp * float(tol)
+
+def _time_stretch_to_target(audio: np.ndarray, sr: int, target_sec: float) -> Tuple[np.ndarray, dict]:
+    """
+    Stretch/shrink audio to match target_sec exactly (in samples).
+    Returns (processed_audio, diagnostics_dict).
+    """
+    target_samples = int(target_sec * sr)
+    original_samples = len(audio)
+
+    if target_samples <= 0:
+        return audio, {"method": "none", "reason": "invalid_target"}
+
+    ratio = target_samples / max(1, original_samples)
+    method = "interp"
+
+    if SCIPY_AVAILABLE and abs(target_samples - original_samples) > 0:
+        # Use resample_poly for better quality
+        # resample_poly(x, up, down) -> len ~ len(x) * up / down
+        # We want len * up/down = target. up/down = target/len.
+        # Use GCD to simplify fraction? scipy handles it reasonably.
+        # But we pass integers.
+        # Simple approx: up=target, down=original.
+        try:
+             # Reduce fraction to avoid huge integers if possible?
+             # Python's math.gcd might help but let's just pass raw.
+             # Note: huge values can be slow.
+             # If ratio is simple, like 1.01, integers might be big.
+             # However, resample_poly is usually robust.
+             # Let's cap max up/down or fallback if too large?
+             # For now, trust scipy.
+
+             # Limitation: resample_poly with very large ints can be slow/memory heavy.
+             # Let's check if ratio is close to 1.0.
+
+             if target_samples > 2**20 or original_samples > 2**20:
+                 # Fallback to linear for very long files to be safe/fast in synth benchmarks
+                 method = "interp"
+             else:
+                 resampled = scipy.signal.resample_poly(audio, target_samples, original_samples)
+                 method = "resample_poly"
+                 # Ensure exact length (resample_poly might act slightly differently on boundaries)
+                 if len(resampled) != target_samples:
+                     # Trim or pad
+                     if len(resampled) > target_samples:
+                         resampled = resampled[:target_samples]
+                     else:
+                         resampled = np.pad(resampled, (0, target_samples - len(resampled)))
+                 return resampled.astype(np.float32), {
+                     "method": method,
+                     "target_samples": target_samples,
+                     "original_samples": original_samples,
+                     "ratio": ratio
+                 }
+        except Exception as e:
+            logger.warning(f"resample_poly failed: {e}. Fallback to interp.")
+            method = "interp_fallback"
+
+    # Fallback: Linear interpolation
+    old_indices = np.linspace(0, original_samples - 1, original_samples)
+    new_indices = np.linspace(0, original_samples - 1, target_samples)
+
+    # interp requires 1D x-coords.
+    # We map new grid (0..target-1) to old grid (0..original-1)
+
+    out_audio = np.interp(new_indices, old_indices, audio).astype(np.float32)
+    return out_audio, {
+        "method": method,
+        "target_samples": target_samples,
+        "original_samples": original_samples,
+        "ratio": ratio
+    }
 
 
 def midi_to_wav_synth(
@@ -213,17 +297,31 @@ def midi_to_wav_synth(
     if max_val > 0:
         audio = audio / max_val * 0.95
 
+    diagnostics = {}
+    enforcement_applied = False
+
     # Enforce duration if target_duration_sec is provided
     if target_duration_sec > 0.0:
-        current_len_sec = _duration_sec(audio, sr)
         if not _duration_ok(audio, sr, target_duration_sec, tol=0.10):
-             # Simple time-stretch via linear interpolation
-             # This is a crude fix but deterministic and dependency-free
-             target_samples = int(target_duration_sec * sr)
-             if abs(target_samples - len(audio)) > 100: # only if significant
-                 old_indices = np.linspace(0, len(audio) - 1, len(audio))
-                 new_indices = np.linspace(0, len(audio) - 1, target_samples)
-                 audio = np.interp(new_indices, old_indices, audio).astype(np.float32)
+             logger.info(f"Enforcing duration: expected {target_duration_sec}s, got {_duration_sec(audio, sr):.2f}s")
+             audio, diag = _time_stretch_to_target(audio, sr, target_duration_sec)
+             diagnostics.update(diag)
+             enforcement_applied = True
+             diagnostics["enforcement_applied"] = True
+             diagnostics["bpm_detected"] = float(detected_bpm)
+             diagnostics["bpm_clamped"] = float(current_bpm)
+             diagnostics["original_duration_sec"] = diagnostics.get("original_samples", 0) / sr
+             diagnostics["target_duration_sec"] = target_duration_sec
 
     sf.write(wav_path, audio, sr)
+
+    # Write diagnostics sidecar if applied
+    if enforcement_applied:
+        try:
+            diag_path = wav_path + ".diagnostics.json"
+            with open(diag_path, "w") as f:
+                json.dump(diagnostics, f, indent=2)
+        except Exception as e:
+            logger.warning(f"Failed to write diagnostics: {e}")
+
     return wav_path
