@@ -100,15 +100,10 @@ def _autocorr_pitch_per_frame(
     if lag_min >= lag_max:
         return f0, conf
 
-    # 1. Apply window
+    # 1. Prepare window (applied per batch to save memory)
     win = np.hanning(frame_length).astype(np.float32)
-    x = frames * win
 
-    # 2. Subtract mean (per frame)
-    x = x - np.mean(x, axis=1, keepdims=True)
-
-    # 3. Compute energy (denom) for later validation
-    denom = np.sum(x**2, axis=1) + 1e-12
+    # Note: x and denom are now computed per batch to save memory
 
     # 4. Vectorized Autocorrelation using FFT (Batched to manage memory)
     # Pad to >= 2*L - 1 to get linear convolution (Wiener-Khinchin)
@@ -119,8 +114,16 @@ def _autocorr_pitch_per_frame(
 
     for start_idx in range(0, n_frames, BATCH_SIZE):
         end_idx = min(start_idx + BATCH_SIZE, n_frames)
-        x_batch = x[start_idx:end_idx]
-        denom_batch = denom[start_idx:end_idx]
+
+        # 1. Apply window (per batch)
+        frames_batch = frames[start_idx:end_idx]
+        x_batch = frames_batch * win
+
+        # 2. Subtract mean (per batch)
+        x_batch = x_batch - np.mean(x_batch, axis=1, keepdims=True)
+
+        # 3. Compute energy (denom) for later validation (per batch)
+        denom_batch = np.sum(x_batch**2, axis=1) + 1e-12
 
         # FFT based autocorrelation
         # Use scipy.fft if available (via _FFT_LIB)
