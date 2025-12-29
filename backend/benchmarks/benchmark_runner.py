@@ -1887,7 +1887,7 @@ class BenchmarkSuite:
                 pass
 
         config = self._prepare_l5_config(config, overrides=overrides, override_path=override_path)
-        _force_stage_b_mode(config, "classic_song")
+        self._force_stage_b_mode(config, "classic_song")
 
         res = run_pipeline_on_audio(
             audio.astype(np.float32),
@@ -2135,6 +2135,17 @@ def resolve_levels(level_arg: str) -> List[str]:
     """Expand user level selection into runnable benchmark levels."""
     if level_arg == "all":
         return LEVEL_ORDER
+
+    if "," in level_arg:
+        levels = []
+        for part in level_arg.split(","):
+            part = part.strip()
+            if part == "L5":
+                levels.extend(["L5.1", "L5.2"])
+            elif part:
+                levels.append(part)
+        return levels
+
     if level_arg == "L5":
         return ["L5.1", "L5.2"]
     return [level_arg]
