@@ -679,6 +679,14 @@ def _snap_chord_starts_with_count(notes: List[NoteEvent], tol_ms: float = 25.0) 
     return out, moved
 
 
+def _snap_time(t: float, anchors: List[float], snap_sec: float) -> float:
+    # Anchors: sorted list of existing onset times.
+    # We check recent ones.
+    for a in reversed(anchors[-10:]):
+        if abs(t - a) <= snap_sec:
+            return a
+    return t
+
 def _merge_notes_across_layers(
     notes: List[NoteEvent],
     pitch_tolerance_cents: float = 50.0,
@@ -694,88 +702,46 @@ def _merge_notes_across_layers(
     if not notes:
         return []
 
-    # Snap onsets first
-    if snap_onset_ms > 0:
-        notes, _ = _snap_chord_starts_with_count(notes, tol_ms=snap_onset_ms)
+    snap_sec = snap_onset_ms / 1000.0
+    gap_sec = max_gap_ms / 1000.0
 
-    notes = sorted(notes, key=lambda n: (float(n.start_sec), -float(n.end_sec), -float(getattr(n, "confidence", 0.0))))
-    out: List[NoteEvent] = []
-    merged_indices = set()
+    # 1) Sort by onset (primary) and pitch (secondary)
+    notes.sort(key=lambda n: (float(n.start_sec), float(n.pitch_hz)))
 
-    for i in range(len(notes)):
-        if i in merged_indices:
-            continue
+    merged: List[NoteEvent] = []
+    onset_anchors: List[float] = []
 
-        current = notes[i]
+    for n in notes:
+        # Snap onset to existing anchors
+        n_start = _snap_time(float(n.start_sec), onset_anchors, snap_sec)
+        n_end = float(n.end_sec)
 
-        # Look ahead for merge candidates
-        # A note is a candidate if:
-        # - Starts before current ends + gap
-        # - Pitch is within tolerance
+        placed = False
+        # Try merge into existing if same pitch (fuzzy) and close in time
+        # Check recent merged notes (local window)
+        for m in reversed(merged[-30:]):
+            if _cents_diff_hz(float(m.pitch_hz), float(n.pitch_hz)) <= pitch_tolerance_cents:
+                # overlap or small gap -> merge
+                # gap = n_start - m_end
+                if n_start <= float(m.end_sec) + gap_sec:
+                    m.end_sec = max(float(m.end_sec), n_end)
+                    if hasattr(n, 'confidence') and hasattr(m, 'confidence'):
+                        m.confidence = max(float(m.confidence or 0), float(n.confidence or 0))
+                    placed = True
+                    break
 
-        active_chain = [current]
+        if not placed:
+            n.start_sec = n_start
+            merged.append(n)
+            # Only add to anchors if it's a new onset?
+            # Or if it was snapped, we effectively reused an anchor.
+            # If we didn't snap (n.start_sec == n_start), we add new anchor.
+            # But here n_start IS the snapped time. So we just append it.
+            # To avoid duplicates in anchors?
+            if not onset_anchors or abs(n_start - onset_anchors[-1]) > 1e-6:
+                onset_anchors.append(n_start)
 
-        # Extending the current note "cluster"
-        # This is a simple greedy merge.
-        # We search forward.
-
-        candidates_to_check = list(range(i + 1, len(notes)))
-
-        # Limit search window to avoid O(N^2) on huge files?
-        # Notes are sorted by start time.
-        # If start time is > current.end + gap, we can stop?
-        # But we need to update current.end as we merge.
-
-        j = i + 1
-        while j < len(notes):
-            if j in merged_indices:
-                j += 1
-                continue
-
-            candidate = notes[j]
-            gap = float(candidate.start_sec) - float(current.end_sec)
-
-            if gap > (max_gap_ms / 1000.0):
-                # Optimization: if gap is huge, and notes sorted by start,
-                # candidates further down won't be mergeable unless they are huge overlaps?
-                # But sorted by start_sec.
-                # If candidate.start > current.end + gap, then any subsequent candidate will also be > current.end + gap
-                # because subsequent.start >= candidate.start.
-                break
-
-            # Check overlap or gap match
-            # Overlap: candidate.start < current.end
-            # Gap: candidate.start > current.end (but < gap limit)
-
-            # Check pitch
-            p1 = float(current.pitch_hz)
-            p2 = float(candidate.pitch_hz)
-            if p1 <= 0 or p2 <= 0:
-                j += 1
-                continue
-
-            cents_diff = abs(1200.0 * math.log2(p2 / p1))
-            if cents_diff <= pitch_tolerance_cents:
-                # Merge!
-                # Update current to cover candidate
-                current.end_sec = max(float(current.end_sec), float(candidate.end_sec))
-                current.confidence = max(float(current.confidence or 0), float(candidate.confidence or 0))
-                # Average pitch? or Keep dominant?
-                # Keep dominant (highest confidence or longest).
-                # Current logic: first one wins pitch unless we explicitly avg.
-                # Let's weighted avg pitch? No, keep it simple: longest/strongest.
-                # Here we just keep 'current's pitch but extend duration.
-
-                merged_indices.add(j)
-
-                # If we extended end_sec, we might overlap more notes now.
-                # The loop continues.
-
-            j += 1
-
-        out.append(current)
-
-    return out
+    return merged
 
 
 def _merge_same_pitch_gaps(

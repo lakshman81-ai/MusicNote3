@@ -59,18 +59,28 @@ def calculate_stage_c_metrics(
         # Check type
         # Assuming NoteEvent objects from models.py
         # They have start_time, end_time, pitch_hz (or similar)
-        if hasattr(n, 'start_time') and hasattr(n, 'end_time'):
-            est_intervals.append([n.start_time, n.end_time])
+
+        start = getattr(n, "start_sec", None)
+        if start is None:
+            start = getattr(n, "start_time", None)
+
+        end = getattr(n, "end_sec", None)
+        if end is None:
+            end = getattr(n, "end_time", None)
+
+        if start is not None and end is not None:
             if hasattr(n, 'pitch_hz'):
+                est_intervals.append([start, end])
                 est_pitches.append(n.pitch_hz)
             elif hasattr(n, 'pitches'): # Chord
                 # Expand chord? Or just take root?
                 # Benchmark usually compares individual notes.
                 # If Stage C returns ChordEvents, we should expand.
                 for p in n.pitches:
-                    est_intervals.append([n.start_time, n.end_time])
+                    est_intervals.append([start, end])
                     est_pitches.append(p) # Hz
             else:
+                 est_intervals.append([start, end])
                  est_pitches.append(440.0) # Fallback
 
     est_intervals = np.array(est_intervals)

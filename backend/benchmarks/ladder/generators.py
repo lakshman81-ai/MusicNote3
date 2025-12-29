@@ -180,7 +180,21 @@ def get_harmony(song_name):
         ]
     return []
 
-def apply_accompaniment(score_in, song_name, style="block"):
+CHORD_MAP = {
+    "C":  ["C4", "E4", "G4"],
+    "Cm": ["C4", "Eb4", "G4"],
+    "G":  ["G3", "B3", "D4"],
+    "F":  ["F3", "A3", "C4"],
+    "Am": ["A3", "C4", "E4"],
+    "Em": ["E3", "G3", "B3"],
+    "Dm": ["D3", "F3", "A3"],
+}
+
+def make_chord(chord_sym: str):
+    pitches = CHORD_MAP.get(chord_sym, ["C4", "E4", "G4"])
+    return chord.Chord(pitches)
+
+def apply_accompaniment(score_in, song_name, style="block", accomp_velocity=50):
     """
     Adds a new Part with accompaniment.
     style: 'block' (L3) or 'broken' (L4).
@@ -201,7 +215,7 @@ def apply_accompaniment(score_in, song_name, style="block"):
         duration = end - start
         if duration <= 0: continue
 
-        c = chord.Chord(chord_sym)
+        c = make_chord(chord_sym)
         # Shift down an octave for accompaniment
         c.transpose(-12, inPlace=True)
 
@@ -210,7 +224,7 @@ def apply_accompaniment(score_in, song_name, style="block"):
             # L3: "soft chordal accompaniment". Let's do sustained chords.
             c.quarterLength = duration
             c.offset = start
-            c.volume.velocity = 50 # Soft
+            c.volume.velocity = accomp_velocity # Soft
             acc_part.insert(start, c)
 
         elif style == "broken":
@@ -231,7 +245,7 @@ def apply_accompaniment(score_in, song_name, style="block"):
                 p_idx = pattern[idx % len(pattern)]
                 n = note.Note(pitches[p_idx])
                 n.quarterLength = min(step_len, end - current_time)
-                n.volume.velocity = 60
+                n.volume.velocity = int(accomp_velocity * 1.2) # slightly louder for broken? default was 60 vs 50
                 acc_part.insert(current_time, n)
                 current_time += step_len
                 idx += 1
@@ -239,7 +253,7 @@ def apply_accompaniment(score_in, song_name, style="block"):
     s.append(acc_part)
     return s
 
-def generate_benchmark_example(example_id: str):
+def generate_benchmark_example(example_id: str, **kwargs):
     """
     Dispatcher to create specific benchmark examples.
     """
@@ -256,12 +270,14 @@ def generate_benchmark_example(example_id: str):
     if "expressive" in example_id:
         s = apply_expressive_performance(s, intensity=1.0)
 
+    accomp_velocity = kwargs.get("accomp_velocity", 50)
+
     if "poly_dominant" in example_id:
         # L3
-        s = apply_accompaniment(s, base_name, style="block")
+        s = apply_accompaniment(s, base_name, style="block", accomp_velocity=accomp_velocity)
 
     if "poly_full" in example_id:
         # L4
-        s = apply_accompaniment(s, base_name, style="broken")
+        s = apply_accompaniment(s, base_name, style="broken", accomp_velocity=accomp_velocity)
 
     return s
