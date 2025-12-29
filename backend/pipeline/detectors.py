@@ -1099,6 +1099,7 @@ class CREPEDetector(BasePitchDetector):
                 viterbi=False, # We do our own smoothing or allow pipeline to handle it
                 step_size=self.step_ms,
                 model_capacity=self.model_capacity,
+                center=True,
                 verbose=0
             )
 

@@ -297,6 +297,7 @@ def main():
     parser.add_argument("--preset", choices=["auto", "none", "l5"], default="auto", help="Config preset strategy")
     parser.add_argument("--dry-run", action="store_true", help="Setup dirs/logs but do not run suite")
     parser.add_argument("--torch-deterministic", action="store_true", help="Force torch deterministic algorithms")
+    parser.add_argument("--l5_2_overrides", help="Inline JSON overrides for L5.2 config")
     args = parser.parse_args()
 
     # 1. Ensure determinism
@@ -334,6 +335,22 @@ def main():
 
     # 4. Determine Base Overrides (Preset)
     base_overrides_flat = {}
+
+    # CLI Override injection (L5.2 specific hack for debug)
+    if args.l5_2_overrides:
+        try:
+            cli_overrides = json.loads(args.l5_2_overrides)
+            if isinstance(cli_overrides, dict):
+                # Flatten it so it merges correctly later?
+                # Actually, `unflatten_overrides` is called later on `base_overrides_flat`.
+                # If `l5_2_overrides` is a nested dict (e.g. {"stage_b": ...}), we should keep it separate
+                # OR flatten it. The script assumes `base_overrides_flat` is flat (dotted).
+                # But `benchmark_runner.py` accepts nested dicts as `overrides`.
+                # Let's keep it separate and merge it into `final_overrides`.
+                pass
+        except json.JSONDecodeError as e:
+            logger.error(f"Invalid JSON in --l5_2_overrides: {e}")
+            sys.exit(1)
 
     use_preset = False
     if args.preset == "l5":
@@ -422,6 +439,32 @@ def main():
             deterministic=True,
             deterministic_torch=args.torch_deterministic
         )
+
+        # Merge CLI overrides if present (e.g. L5.2 debug)
+        if args.l5_2_overrides:
+            cli_overrides = json.loads(args.l5_2_overrides)
+            # We assume cli_overrides are nested dicts.
+            # final_overrides is currently base_overrides_flat unflattened.
+            # We need to merge cli_overrides into final_overrides (deep merge).
+            # Simple recursive update or just update?
+            # Since final_overrides is from base_overrides_flat (preset), CLI should win.
+            # BenchmarkSuite._deep_merge_config logic is available but private.
+            # We'll just do a simple top-level update if possible, or assume user provides full paths.
+            # Actually, `unflatten_overrides` works on flat dicts.
+            # If user passed nested dict, we can't mix easily without a helper.
+            # Let's rely on BenchmarkSuite's behavior: it accepts ONE overrides dict.
+            # So we merge them here.
+            # Hack: convert final_overrides (nested) + cli_overrides (nested) -> merged.
+            # Since we don't have deep_merge here easily, we will pass cli_overrides as the overrides
+            # for L5.2 if present, IGNORING preset if user explicitly overrides?
+            # No, user wants to modify preset.
+            # Let's import the Deep Merge helper from the runner class? No, it's instance method.
+            # We'll just apply it on top if keys don't conflict deeply.
+            for k, v in cli_overrides.items():
+                if isinstance(v, dict) and k in final_overrides and isinstance(final_overrides[k], dict):
+                    final_overrides[k].update(v) # 1-level deep merge
+                else:
+                    final_overrides[k] = v
 
         for lvl in levels_to_run:
             if lvl == "L0":
