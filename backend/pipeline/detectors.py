@@ -250,6 +250,7 @@ def create_harmonic_mask(
     n_harmonics: int = 8,
     min_band_hz: float = 6.0,
     frequency_aware_width: bool = False,
+    batch_size: int = 2000,
 ) -> np.ndarray:
     """
     Create a time-frequency mask that zeros bins around harmonics of f0.
@@ -266,45 +267,68 @@ def create_harmonic_mask(
     # We transpose back to (n_bins, n_frames) at the end.
     mask_T = np.ones((n_frames, n_bins), dtype=np.float32)
 
-    # Frequency per bin
-    bin_hz = float(sr) / float(n_fft)
+    # Bin indices for vectorized comparison
+    bin_idxs = np.arange(n_bins, dtype=np.int64)
 
-    for t in range(n_frames):
-        f0 = float(f0_hz[t])
-        if f0 <= 0.0 or not np.isfinite(f0):
-            continue
+    # Process in batches to avoid OOM
+    for start in range(0, n_frames, batch_size):
+        end = min(start + batch_size, n_frames)
+        # Use float64 for f0 and calculations to match legacy precision
+        f0_batch = f0_hz[start:end].astype(np.float64)
+
+        # Valid mask (f0 > 0, finite)
+        valid_f0 = (f0_batch > 0.0) & np.isfinite(f0_batch)
+
+        # Safe f0 for calculation (replace invalid with dummy)
+        f0_safe = np.where(valid_f0, f0_batch, 1.0)
+
+        # View into the target mask array
+        mask_view = mask_T[start:end]
+
+        # Use float64 for bin_hz
+        bin_hz_64 = np.float64(sr) / np.float64(n_fft)
 
         for h in range(1, n_harmonics + 1):
-            fh = f0 * h
-            if fh >= float(sr) / 2.0:
-                break
+            fh = f0_safe * h
+
+            # Legacy logic: if fh >= sr/2, break.
+            # Vectorized: mask out frames where fh >= sr/2
+            below_nyquist = (fh < float(sr) / 2.0)
+
+            # Optim: if no frames in this batch are valid and below nyquist, stop harmonics
+            active = valid_f0 & below_nyquist
+            if not np.any(active):
+                if not np.any(below_nyquist[valid_f0]):
+                    break
 
             if frequency_aware_width:
-                 # Wider for low notes, narrower for high notes
-                 # fh is scalar here (float), so comparison is safe.
-                 # Let's boost mask width for low freqs (<200Hz)
-                 width_factor = 1.0
-                 if fh < 200.0:
-                     width_factor = 1.0 + (200.0 - fh) / 100.0
-                 bw = max(float(min_band_hz), abs(mask_width * width_factor) * fh)
+                 width_factor = np.ones_like(fh)
+                 low_freq = (fh < 200.0)
+                 width_factor[low_freq] = 1.0 + (200.0 - fh[low_freq]) / 100.0
+                 bw = np.maximum(float(min_band_hz), np.abs(mask_width * width_factor) * fh)
             else:
-                bw = max(float(min_band_hz), abs(mask_width) * fh)
+                 bw = np.maximum(float(min_band_hz), np.abs(mask_width) * fh)
 
             lo = fh - bw
             hi = fh + bw
 
-            # Vectorized index calculation
-            # lo <= i * bin_hz <= hi  =>  lo/bin_hz <= i <= hi/bin_hz
-            idx_lo = int(np.ceil(lo / bin_hz))
-            idx_hi = int(np.floor(hi / bin_hz))
+            idx_lo = np.ceil(lo / bin_hz_64).astype(np.int64)
+            idx_hi = np.floor(hi / bin_hz_64).astype(np.int64)
 
-            # Clamp to valid range
-            idx_lo = max(0, idx_lo)
-            idx_hi = min(n_bins - 1, idx_hi)
+            idx_lo = np.maximum(0, idx_lo)
+            idx_hi = np.minimum(n_bins - 1, idx_hi)
 
-            if idx_lo <= idx_hi:
-                # Contiguous slice update on the transposed array
-                mask_T[t, idx_lo : idx_hi + 1] = 0.0
+            # Apply mask where active and valid range
+            frame_mask = active & (idx_lo <= idx_hi)
+
+            if np.any(frame_mask):
+                # Broadcasting mask application
+                mask_bins = (bin_idxs[None, :] >= idx_lo[:, None]) & \
+                            (bin_idxs[None, :] <= idx_hi[:, None])
+
+                # Combine with frame_mask
+                to_zero = mask_bins & frame_mask[:, None]
+                mask_view[to_zero] = 0.0
 
     return mask_T.T
 
