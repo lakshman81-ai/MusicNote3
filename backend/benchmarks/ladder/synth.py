@@ -2,6 +2,9 @@ import numpy as np
 import soundfile as sf
 from music21 import stream, note, chord, tempo
 
+import logging
+logger = logging.getLogger(__name__)
+
 def _clamp_bpm(bpm: float, lo: float = 20.0, hi: float = 300.0, default: float = 120.0) -> float:
     try:
         bpm = float(bpm)
@@ -12,6 +15,11 @@ def _clamp_bpm(bpm: float, lo: float = 20.0, hi: float = 300.0, default: float =
     if bpm < lo or bpm > hi:
         return default
     return bpm
+
+def _note_gap_sec(dur_sec: float, *,
+                  max_gap=0.10,
+                  frac=0.20) -> float:
+    return min(max_gap, max(0.0, dur_sec * frac))
 
 def _duration_sec(audio: np.ndarray, sr: int) -> float:
     if audio is None or sr <= 0:
@@ -30,6 +38,8 @@ def midi_to_wav_synth(
     sr: int = 22050,
     use_enhanced_synth: bool = False,
     target_duration_sec: float = 0.0,
+    diagnostics: dict = None,
+    **kwargs
 ):
     """
     Synthesizes a Music21 stream to a WAV file using simple sine waves.
@@ -67,6 +77,13 @@ def midi_to_wav_synth(
     detected_bpm = _extract_bpm(score_stream)
     current_bpm = _clamp_bpm(detected_bpm, lo=20.0, hi=300.0, default=120.0)
 
+    if diagnostics is not None:
+        diagnostics["tempo_detected_bpm"] = detected_bpm
+        diagnostics["tempo_used_bpm"] = current_bpm
+        diagnostics["tempo_clamped"] = (current_bpm != detected_bpm)
+        if diagnostics["tempo_clamped"]:
+            logger.warning(f"Synth tempo clamped: detected={detected_bpm} used={current_bpm}")
+
     # We need to process chords and notes
     # music21.chord.Chord contains notes.
     # music21.note.Note is a single note.
@@ -103,22 +120,36 @@ def midi_to_wav_synth(
 
     sec_per_quarter = 60.0 / current_bpm
 
+    articulation_enabled = kwargs.get("articulation_enabled", False)
+    articulation_max_gap = kwargs.get("articulation_max_gap_sec", 0.10)
+    articulation_frac = kwargs.get("articulation_frac", 0.20)
+
     flat_els = score_stream.flatten().elements
 
     for el in flat_els:
         if isinstance(el, note.Note):
             start_sec = el.offset * sec_per_quarter
             dur_sec = el.quarterLength * sec_per_quarter
+
+            gap = 0.0
+            if articulation_enabled:
+                gap = _note_gap_sec(dur_sec, max_gap=articulation_max_gap, frac=articulation_frac)
+
             freq = el.pitch.frequency
             vel = el.volume.velocity if el.volume.velocity else 90
-            events.append((start_sec, dur_sec, freq, vel))
+            events.append((start_sec, dur_sec - gap, freq, vel))
 
         elif isinstance(el, chord.Chord):
             start_sec = el.offset * sec_per_quarter
             dur_sec = el.quarterLength * sec_per_quarter
+
+            gap = 0.0
+            if articulation_enabled:
+                gap = _note_gap_sec(dur_sec, max_gap=articulation_max_gap, frac=articulation_frac)
+
             vel = el.volume.velocity if el.volume.velocity else 90
             for p in el.pitches:
-                events.append((start_sec, dur_sec, p.frequency, vel))
+                events.append((start_sec, dur_sec - gap, p.frequency, vel))
 
     def _waveform(freq, t, amp):
         if not use_enhanced_synth:
