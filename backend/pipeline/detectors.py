@@ -193,48 +193,70 @@ def _autocorr_pitch_per_frame_safe(
     if lag_min >= lag_max:
         return f0_out, conf_out
 
-    # Numba optimization hook (if available, otherwise pure Python)
-    # Since we can't easily rely on numba being present, we write pure python optimized
-    # loop or accept it is slow (fallback).
+    # Bolt Optimization: Vectorized safe fallback (FFT-based but without windowing/padding tricks that alter behavior)
+    # This replaces the O(N*L) loop with O(N*log L) batch operations while preserving logic.
 
-    for i in range(n_frames):
-        frame = frames[i].astype(np.float32)
-        # DC removal
-        frame = frame - np.mean(frame)
+    # 1. DC Removal (Vectorized)
+    frames_c = frames - np.mean(frames, axis=1, keepdims=True)
 
-        # ACF
-        # mode='full' gives 2*L-1 output. lag 0 is at index L-1.
-        # We only need positive lags.
-        # This is slow per frame but robust.
-        corr = np.correlate(frame, frame, mode="full")[len(frame)-1:]
+    # 2. ACF via FFT (Vectorized)
+    # Pad to >= 2*L - 1 for linear convolution to match np.correlate(mode='full') behavior
+    # Use next_fast_len for optimal FFT size
+    fft_len = 2 ** int(np.ceil(np.log2(2 * frame_length - 1)))
+    if hasattr(_FFT_LIB, "next_fast_len"):
+         fft_len = _FFT_LIB.next_fast_len(2 * frame_length - 1)
 
-        c0 = float(corr[0])
-        if c0 <= 1e-12:
-            continue
+    BATCH_SIZE = 2000
 
-        # Normalize by zero-lag energy
-        norm_corr = corr / (c0 + 1e-12)
+    for start in range(0, n_frames, BATCH_SIZE):
+        end = min(start + BATCH_SIZE, n_frames)
+        batch_frames = frames_c[start:end]
 
-        best_lag = 0
-        max_val = 0.0
+        # FFT correlation
+        X = _FFT_LIB.rfft(batch_frames, n=fft_len, axis=1)
+        P = X * np.conj(X)
+        ac = _FFT_LIB.irfft(P, n=fft_len, axis=1)
 
-        # Iterative peak picking with bounds checks
-        # range(lag_min, lag_max + 1) covers lags we want to check.
-        # We need neighbor access lag-1 and lag+1.
-        # Since lag_min >= 1, lag-1 >= 0.
-        # Since lag_max <= len-3, lag+1 <= len-2.
+        # Take first frame_length (corresponds to positive lags 0..L-1)
+        corr = ac[:, :frame_length]
 
-        for lag in range(lag_min, lag_max + 1):
-            val = float(norm_corr[lag])
-            if val > threshold and val > max_val:
-                # Safe neighbor check (local maximum)
-                if norm_corr[lag - 1] < val and norm_corr[lag + 1] < val:
-                    max_val = val
-                    best_lag = lag
+        # 3. Normalize
+        raw_c0 = corr[:, 0]
+        c0 = raw_c0 + 1e-12
+        norm_corr = corr / c0[:, None]
 
-        if best_lag > 0:
-            f0_out[i] = sr / best_lag
-            conf_out[i] = max_val
+        # 4. Peak picking (Vectorized)
+        # Extract slices for neighbors
+        # left:   [lag_min-1 : lag_max]
+        # center: [lag_min   : lag_max+1]
+        # right:  [lag_min+1 : lag_max+2]
+        left   = norm_corr[:, lag_min - 1 : lag_max]
+        center = norm_corr[:, lag_min     : lag_max + 1]
+        right  = norm_corr[:, lag_min + 1 : lag_max + 2]
+
+        # Strict neighbor check: must be strictly greater than neighbors
+        is_local_peak = (left < center) & (right < center)
+        is_valid = (center > threshold) & is_local_peak
+
+        # Mask invalid peaks
+        masked_center = np.where(is_valid, center, -1.0)
+
+        # Find argmax (highest valid peak)
+        best_idx = np.argmax(masked_center, axis=1)
+        max_val = masked_center[np.arange(len(masked_center)), best_idx]
+
+        found_peak = max_val > -1.0
+        best_lag = best_idx + lag_min
+
+        # Original code check: if c0 <= 1e-12 continue
+        valid_batch = found_peak & (raw_c0 > 1e-12)
+
+        # Map to global indices
+        idx_local = np.where(valid_batch)[0]
+        if len(idx_local) > 0:
+            idx_global = start + idx_local
+            f0_out[idx_global] = sr / best_lag[idx_local]
+            conf_out[idx_global] = max_val[idx_local]
 
     return f0_out, conf_out
 
