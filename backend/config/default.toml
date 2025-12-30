@@ -1,0 +1,99 @@
+[io]
+sample_rate = 44100
+sample_fmt = "pcm_s16le"
+channels = 2
+time_signature = "4/4"
+divisions = 960
+fallback_bpm = 120.0
+
+[cache]
+enabled = true
+schema_version = 2
+reuse_policy = "warn"
+float_mode = "g12"
+
+[logging]
+commands_tail_bytes = 4096
+
+[backend_policy]
+fallback_mode = "auto"
+allow_off = true
+
+[backend_priority]
+separation   = ["demucs_py", "demucs_cli", "none"]
+piano_tx     = ["bytedance_py", "piano_cli", "none"]
+vocal_tx     = ["basic_pitch_py", "basic_pitch_cli", "none"]
+beats        = ["madmom_py", "sonic_cli", "off"]
+quantize     = ["music21_py", "dp_cost_lite", "grid_lite"]
+midi_parser  = ["mido_py", "minimal"]
+duration_fix = ["scipy_resample_poly", "interp_linear", "none"]
+
+[tools]
+ffmpeg = "ffmpeg"
+demucs = "demucs"
+sonic_annotator = "sonic-annotator"
+
+[views]
+normalize_mode = "peak"
+
+[views.filters]
+full = "anull"
+low = "lowpass=f=250"
+mid = "bandpass=f=1000:w=2"
+center = "pan=mono|c0=0.5*c0+0.5*c1"
+side = "pan=mono|c0=0.5*c0-0.5*c1"
+
+[separation.demucs]
+enabled = true
+mode = "4stem"
+shifts_fast = 0
+shifts_final = 2
+overlap = 0.25
+
+[separation.demucs.stems]
+piano_stems = ["other", "bass"]
+skip_stems = ["drums"]
+vocal_stem = "vocals"
+also_transcribe_no_vocals = false
+
+[beats]
+backend = "auto"
+min_beats = 8
+max_gap_s = 1.5
+
+[merge]
+enabled = true
+onset_snap_ms = 20
+gap_merge_ms = 30
+dedupe_overlap_iou = 0.65
+prefer_longer = true
+
+[merge.weights]
+conf = 1.0
+dur  = 0.2
+vel  = 0.1
+
+[merge.weights.stem]
+other = 1.0
+bass = 0.8
+no_vocals = 0.9
+
+[cleanup]
+min_dur_s = 0.06
+merge_gap_s = 0.03
+dedup_eps_s = 0.02
+clamp_to_audio = true
+
+[quantize]
+allowed_grids = [16, 12, 24]
+max_tuplet_level = 3
+soft_snap_tol_div = 24
+max_snap_div = 12
+
+[engrave]
+staff_split_midi = 60
+max_voices_per_staff = 2
+tie_across_barlines = true
+protect_melody = true
+melody_top_percentile = 0.15
+drop_policy_max_chord_size = 6

@@ -1,0 +1,12 @@
+[separation.demucs]
+enabled = false
+
+[merge]
+enabled = false
+
+[engrave]
+max_voices_per_staff = 3
+protect_melody = true
+
+[cleanup]
+min_dur_s = 0.05
