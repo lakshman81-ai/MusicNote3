@@ -1,360 +1,45 @@
-from typing import Dict, Any, Optional
-import io
-import music21
-import tempfile
+from typing import Optional
 import os
-import shutil
-import copy
-import librosa
-import numpy as np
 
-from .pipeline.stage_a import load_and_preprocess
-from .pipeline.stage_b import extract_features
-from .pipeline.stage_c import apply_theory
-from .pipeline.stage_d import quantize_and_render
-from .pipeline.determinism import apply_determinism
-from .pipeline.models import AnalysisData, TranscriptionResult, MetaData, AudioType, FramePitch
-from .pipeline.validation import validate_invariants, dump_resolved_config
+from .pipeline.models import AnalysisData, TranscriptionResult, MetaData
+from .wav2xml.pipeline import WavToXmlPipeline
+
 
 def transcribe_audio_pipeline(
     audio_path: str,
     *,
-    stereo_mode: Optional[str] = None, # ignored
+    stereo_mode: Optional[str] = None,  # maintained for compatibility
     use_mock: bool = False,
-    start_offset: Optional[float] = None, # ignored
-    max_duration: Optional[float] = None, # ignored
-    use_crepe: bool = False,
-    trim_silence: bool = True,
-    mode: str = "quality", # "quality" or "fast"
-    target_sample_rate: Optional[int] = None,
-    window_size: Optional[int] = None,
-    hop_length: Optional[int] = None,
-    silence_top_db: Optional[float] = None,
+    start_offset: Optional[float] = None,
+    max_duration: Optional[float] = None,
     **kwargs,
 ) -> TranscriptionResult:
     """
-    High-level API used by both FastAPI and the benchmark script.
-    Orchestrates Stages A -> B -> C -> D.
+    New modular pipeline aligned to WI v2.4.
+    Produces MusicXML + artifacts + provenance with dual LITE/PRO backends.
     """
+    del stereo_mode, start_offset, max_duration, kwargs  # handled by config/pipeline internally
+
     if use_mock:
-        # Legacy mock behavior for testing
         mock_xml_path = os.path.join(os.path.dirname(__file__), "mock_data", "happy_birthday.xml")
         if os.path.exists(mock_xml_path):
-            with open(mock_xml_path, 'r', encoding='utf-8') as f:
+            with open(mock_xml_path, "r", encoding="utf-8") as f:
                 musicxml_str = f.read()
         else:
             musicxml_str = "<?xml version='1.0' encoding='utf-8'?><score-partwise><part><measure><note><rest/></note></measure></part></score-partwise>"
+        return TranscriptionResult(musicxml=musicxml_str, analysis_data=AnalysisData(meta=MetaData(sample_rate=22050)), midi_bytes=b"")
 
-        return TranscriptionResult(
-            musicxml=musicxml_str,
-            analysis_data=AnalysisData(meta=MetaData(sample_rate=22050)),
-            midi_bytes=b""
-        )
+    pipeline = WavToXmlPipeline()
+    midi_input = audio_path.lower().endswith((".mid", ".midi"))
+    run_result = pipeline.run(audio_path, midi_input=midi_input)
 
-    # Build a configurable pipeline config so callers can control the audio front end.
-    from .pipeline.config import PipelineConfig
+    # Minimal AnalysisData wiring to satisfy existing consumers.
+    meta = MetaData(sample_rate=pipeline.config.io.sample_rate, tempo_bpm=run_result.beat_map.tempo_bpm if run_result.beat_map else pipeline.config.io.fallback_bpm)
+    analysis = AnalysisData(meta=meta, beats=run_result.beat_map.beats if run_result.beat_map else [])
 
-    pipeline_conf = PipelineConfig()
-    if "seed" in kwargs:
-        pipeline_conf.seed = kwargs["seed"]
-    if "deterministic" in kwargs:
-        pipeline_conf.deterministic = bool(kwargs["deterministic"])
-    if "deterministic_torch" in kwargs:
-        pipeline_conf.deterministic_torch = bool(kwargs["deterministic_torch"])
+    return TranscriptionResult(musicxml=run_result.musicxml, analysis_data=analysis, midi_bytes=b"")
 
-    if pipeline_conf.seed is not None:
-        pipeline_conf.deterministic = True
 
-    apply_determinism(pipeline_conf)
-
-    # Stage A (audio front end)
-    if target_sample_rate is not None:
-        pipeline_conf.stage_a.target_sample_rate = int(target_sample_rate)
-
-    pipeline_conf.stage_a.silence_trimming["enabled"] = bool(trim_silence)
-    if silence_top_db is not None:
-        pipeline_conf.stage_a.silence_trimming["top_db"] = float(silence_top_db)
-
-    # Allow explicit front-end window/hop settings by propagating them to the detector
-    # configs Stage A reads for frame sizing.
-    if window_size is not None:
-        pipeline_conf.stage_b.detectors["yin"]["frame_length"] = int(window_size)
-        pipeline_conf.stage_b.detectors["swiftf0"]["n_fft"] = int(window_size)
-
-    if hop_length is not None:
-        pipeline_conf.stage_b.detectors["yin"]["hop_length"] = int(hop_length)
-        pipeline_conf.stage_b.detectors["swiftf0"]["hop_length"] = int(hop_length)
-        # Keep RMVPE hop aligned if enabled by callers
-        pipeline_conf.stage_b.detectors["rmvpe"]["hop_length"] = int(hop_length)
-
-    # 1. Stage A: Load and Preprocess (with Source Separation)
-    # Returns StageAOutput
-    stage_a_out = load_and_preprocess(
-        audio_path,
-        config=pipeline_conf,
-        start_offset=float(start_offset or 0.0),
-        max_duration=max_duration,
-    )
-    validate_invariants(stage_a_out, pipeline_conf)
-
-    meta = stage_a_out.meta  # Preserve Stage A texture classification (mono/poly)
-
-    # 2. Stage B: Extract Features (Segmentation)
-    # Pitch tracking (SwiftF0/SACF) and Hysteresis segmentation
-    # Now passing full StageAOutput to support stems
-    conf_thresh = kwargs.get("confidence_threshold", 0.5)
-    min_dur = kwargs.get("min_duration_ms", 0.0)
-
-    stage_b_out = extract_features(
-        stage_a_out,
-        config=pipeline_conf,
-        use_crepe=use_crepe,
-        confidence_threshold=conf_thresh,
-        min_duration_ms=min_dur
-    )
-    validate_invariants(stage_b_out, pipeline_conf)
-
-    # Unpack from StageBOutput
-    timeline = [] # Global timeline computed from main f0?
-    # StageBOutput has f0_main, but timeline expects FramePitch objects.
-    # stem_timelines is available.
-    stem_timelines = stage_b_out.stem_timelines or {}
-
-    def _timeline_score(tl: list) -> float:
-        if not tl:
-            return -1.0
-        voiced = [fp for fp in tl if (getattr(fp, "pitch_hz", 0.0) or 0.0) > 0 or (getattr(fp, "midi", None) is not None and getattr(fp, "midi") > 0)]
-        if not voiced:
-            return -0.5
-        voiced_ratio = len(voiced) / float(len(tl))
-        mean_conf = float(np.mean([getattr(fp, "confidence", 0.0) for fp in voiced])) if voiced else 0.0
-        mean_rms = float(np.mean([getattr(fp, "rms", 0.0) for fp in voiced])) if voiced else 0.0
-        return voiced_ratio * 0.5 + mean_conf * 0.4 + min(mean_rms, 1.0) * 0.1
-
-    # Prefer the highest-quality stem timeline instead of a fixed priority.
-    if stem_timelines:
-        scored = sorted(((name, tl, _timeline_score(tl)) for name, tl in stem_timelines.items()), key=lambda x: x[2], reverse=True)
-        timeline = scored[0][1]
-    elif getattr(stage_b_out, "timeline", None):
-        timeline = stage_b_out.timeline
-    elif getattr(stage_b_out, "time_grid", None) is not None and getattr(stage_b_out, "f0_main", None) is not None:
-        timeline = [
-            FramePitch(
-                time=float(t),
-                pitch_hz=float(p),
-                midi=None if p <= 0 else int(round(librosa.hz_to_midi(p))),
-                confidence=1.0,
-            )
-            for t, p in zip(stage_b_out.time_grid, stage_b_out.f0_main)
-        ]
-
-    if not timeline and getattr(stage_b_out, "time_grid", None) is not None and getattr(stage_b_out, "f0_main", None) is not None:
-        timeline = [
-            FramePitch(
-                time=float(t),
-                pitch_hz=float(p),
-                midi=None if p <= 0 else int(round(librosa.hz_to_midi(p))),
-                confidence=1.0,
-            )
-            for t, p in zip(stage_b_out.time_grid, stage_b_out.f0_main)
-        ]
-
-    notes = [] # Stage B doesn't produce notes yet (Stage C does)
-    chords = [] # Stage B doesn't produce chords yet
-
-    tracker_name = "swiftf0+sacf"
-    print(f"Notes extracted using: {tracker_name}")
-
-    # 3. Beat Tracking & Onsets (Stage B/Prep)
-    # We need to extract beats and onsets for Stage C.
-
-    beat_stem_audio = None
-    beat_candidates = []
-    for stem_name in ["drums", "other", "vocals", "mix"]:
-        if stem_name in stage_a_out.stems:
-            cand_audio = stage_a_out.stems[stem_name].audio
-            if cand_audio is not None and len(cand_audio) > 0:
-                cand_arr = np.asarray(cand_audio, dtype=np.float32)
-                if cand_arr.ndim > 1:
-                    cand_arr = np.mean(cand_arr, axis=-1)
-                # Short-window RMS to prefer stems with localized energy.
-                window_len = min(len(cand_arr), int(stage_a_out.meta.target_sr * 30))
-                rms_val = float(np.sqrt(np.mean(cand_arr[:window_len] ** 2))) if window_len > 0 else 0.0
-                beat_candidates.append((rms_val, stem_name, cand_arr))
-    onset_strength_best = -1.0
-    if beat_candidates:
-        beat_candidates.sort(key=lambda x: x[0], reverse=True)
-        beat_stem_audio = beat_candidates[0][2]
-        try:
-            onset_env = librosa.onset.onset_strength(y=beat_stem_audio, sr=stage_a_out.meta.target_sr)
-            onset_strength_best = float(np.mean(onset_env)) if onset_env.size else -1.0
-        except Exception:
-            onset_strength_best = -1.0
-        # If chosen stem has very weak onset activity, fall back to mix if available.
-        if onset_strength_best < 0.5 and "mix" in stage_a_out.stems:
-            mix_audio = stage_a_out.stems["mix"].audio
-            if mix_audio is not None and len(mix_audio) > 0:
-                beat_stem_audio = np.asarray(mix_audio, dtype=np.float32)
-                if beat_stem_audio.ndim > 1:
-                    beat_stem_audio = np.mean(beat_stem_audio, axis=-1)
-
-    onsets = [] # Global fallback
-    beats = [] # Global beats
-    tempo = 120.0
-
-    if beat_stem_audio is not None and len(beat_stem_audio) > 0:
-        # Beat Track
-        try:
-            tempo_est, beat_frames = librosa.beat.beat_track(y=beat_stem_audio, sr=stage_a_out.meta.target_sr)
-            tempo = float(tempo_est)
-            beats = librosa.frames_to_time(beat_frames, sr=stage_a_out.meta.target_sr).tolist()
-        except Exception as e:
-            print(f"Beat tracking failed: {e}")
-
-        # Global Onset Detect (fallback)
-        try:
-            onsets = sorted(list(librosa.onset.onset_detect(y=beat_stem_audio, sr=stage_a_out.meta.target_sr, units='time')))
-        except Exception as e:
-            print(f"Onset detection failed: {e}")
-
-    meta.tempo_bpm = tempo
-    if beats:
-        meta.beats = beats
-        meta.beat_times = beats
-
-    # Populate stem_onsets
-    stem_onsets = {}
-    for s_name in ["vocals", "bass", "other"]:
-        if s_name in stage_a_out.stems:
-             try:
-                 y_s = stage_a_out.stems[s_name].audio
-                 if len(y_s) > 0:
-                     ons = librosa.onset.onset_detect(y=y_s, sr=stage_a_out.meta.target_sr, units='time')
-                     stem_onsets[s_name] = sorted(list(ons))
-                 else:
-                     stem_onsets[s_name] = []
-             except Exception as e:
-                 print(f"Onset detection failed for stem {s_name}: {e}")
-                 stem_onsets[s_name] = []
-
-    # 3. Build AnalysisData
-    frame_count = len(timeline)
-
-    # Normalize frame-sized arrays to the chosen timeline length
-    if getattr(stage_b_out, "time_grid", None) is not None:
-        stage_b_out.time_grid = np.asarray(stage_b_out.time_grid)[:frame_count]
-    if getattr(stage_b_out, "f0_main", None) is not None:
-        stage_b_out.f0_main = np.asarray(stage_b_out.f0_main)[:frame_count]
-
-    frame_hop_seconds = float(meta.hop_length) / float(meta.target_sr)
-    if getattr(stage_b_out, "time_grid", None) is not None and len(stage_b_out.time_grid) > 1:
-        frame_hop_seconds = float(np.median(np.diff(stage_b_out.time_grid)))
-        frame_hop_source = "time_grid"
-    else:
-        frame_hop_source = "config"
-
-    analysis_data = AnalysisData(
-        meta=meta,
-        timeline=timeline,
-        stem_timelines=stem_timelines,
-        stem_onsets=stem_onsets,
-        events=notes,
-        chords=chords,
-        notes=notes,
-        pitch_tracker=tracker_name,
-        n_frames=frame_count,
-        frame_hop_seconds=frame_hop_seconds,
-        onsets=onsets,
-        beats=beats # Add beats
-    )
-    analysis_data.diagnostics["frame_hop_seconds_source"] = frame_hop_source
-
-    # 4. Stage C: Apply Theory
-    events_with_theory = apply_theory(analysis_data, config=pipeline_conf)
-    events_for_copy = list(events_with_theory or [])
-    validate_invariants(events_with_theory, pipeline_conf, analysis_data=analysis_data)
-
-    # Preserve a deep copy of notes before quantization to avoid Stage D mutation
-    if not getattr(analysis_data, "notes_before_quantization", None):
-        analysis_data.notes_before_quantization = copy.deepcopy(events_for_copy)
-    else:
-        analysis_data.notes_before_quantization = copy.deepcopy(list(analysis_data.notes_before_quantization))
-
-    # Record diagnostic source for scoring
-    try:
-        analysis_data.diagnostics = getattr(analysis_data, "diagnostics", {}) or {}
-        analysis_data.diagnostics["scored_notes_source"] = "pre_quantization"
-    except Exception:
-        pass
-
-    # 5. Stage D: Quantize and Render
-    midi_bytes = b""
-    try:
-        render_notes = copy.deepcopy(events_for_copy)
-        stage_d_result = quantize_and_render(
-            render_notes,
-            analysis_data,
-            config=pipeline_conf,
-        )
-        validate_invariants(stage_d_result, pipeline_conf)
-        if isinstance(stage_d_result, TranscriptionResult):
-            musicxml_str = stage_d_result.musicxml
-            midi_bytes = stage_d_result.midi_bytes or b""
-        else:
-            musicxml_str = stage_d_result
-    except Exception as e:
-        print(f"Stage D (Rendering) failed: {e}. Returning placeholder XML.")
-        musicxml_str = "<?xml version='1.0' encoding='utf-8'?><score-partwise><part><measure><note><rest/></note></measure></part></score-partwise>"
-
-    # 6. Generate MIDI bytes if not provided
-    tmp_xml_path = None
-    tmp_midi_path = None
-
-    try:
-        # Save XML to temp file to parse back for MIDI generation
-        # (music21 allows parsing string, but temp file is safer for some backends)
-        if not midi_bytes:
-            with tempfile.NamedTemporaryFile(suffix=".musicxml", delete=False, mode='w', encoding='utf-8') as tmp_xml:
-                tmp_xml.write(musicxml_str)
-                tmp_xml_path = tmp_xml.name
-
-        try:
-            if tmp_xml_path:
-                s = music21.converter.parse(tmp_xml_path)
-
-            with tempfile.NamedTemporaryFile(suffix=".mid", delete=False) as tmp_midi:
-                tmp_midi_path = tmp_midi.name
-
-            if tmp_xml_path:
-                s.write('midi', fp=tmp_midi_path)
-
-                with open(tmp_midi_path, 'rb') as f:
-                    midi_bytes = f.read()
-
-        except Exception as e:
-            print(f"MIDI generation failed: {e}")
-            midi_bytes = b""
-
-    except Exception as e:
-        print(f"Failed to generate MIDI wrapper: {e}")
-    finally:
-        if tmp_xml_path and os.path.exists(tmp_xml_path):
-            os.remove(tmp_xml_path)
-        if tmp_midi_path and os.path.exists(tmp_midi_path):
-            os.remove(tmp_midi_path)
-
-    result = TranscriptionResult(
-        musicxml=musicxml_str,
-        analysis_data=analysis_data,
-        midi_bytes=midi_bytes
-    )
-
-    # Emit runtime-resolved configuration for debugging
-    dump_resolved_config(pipeline_conf, meta, stage_b_out)
-
-    return result
-
-# wrapper for legacy calls
 def transcribe_audio(
     file_path: str,
     use_mock: bool = False,

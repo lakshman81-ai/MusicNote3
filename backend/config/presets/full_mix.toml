@@ -1,0 +1,24 @@
+[separation.demucs]
+enabled = true
+mode = "4stem"
+shifts_final = 2
+
+[separation.demucs.stems]
+piano_stems = ["other", "bass"]
+also_transcribe_no_vocals = true
+
+[merge]
+enabled = true
+onset_snap_ms = 18
+gap_merge_ms = 25
+dedupe_overlap_iou = 0.7
+
+[cleanup]
+min_dur_s = 0.07
+
+[engrave]
+max_voices_per_staff = 2
+
+[backend_policy]
+fallback_mode = "auto"
+allow_off = true
