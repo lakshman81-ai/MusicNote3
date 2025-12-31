@@ -177,6 +177,9 @@ def _autocorr_pitch_per_frame_safe(
     Iterative 'safe' ACF fallback for robustness.
     Includes explicit mean removal, zero-lag energy normalization,
     and strict neighbor checks for peak picking.
+
+    Bolt Optimization: Now vectorized with FFT for significant speedup while
+    preserving the exact logic (no window, strict neighbor check).
     """
     n_frames, frame_length = frames.shape
     f0_out = np.zeros((n_frames,), dtype=np.float32)
@@ -193,48 +196,62 @@ def _autocorr_pitch_per_frame_safe(
     if lag_min >= lag_max:
         return f0_out, conf_out
 
-    # Numba optimization hook (if available, otherwise pure Python)
-    # Since we can't easily rely on numba being present, we write pure python optimized
-    # loop or accept it is slow (fallback).
+    # 1. DC Removal
+    means = np.mean(frames, axis=1, keepdims=True)
+    x = frames - means
 
-    for i in range(n_frames):
-        frame = frames[i].astype(np.float32)
-        # DC removal
-        frame = frame - np.mean(frame)
+    # 2. Autocorrelation via FFT (Batched)
+    # Pad to 2*L-1 for linear convolution
+    n_fft = 2 ** int(np.ceil(np.log2(2 * frame_length - 1)))
+    BATCH_SIZE = 2000
 
-        # ACF
-        # mode='full' gives 2*L-1 output. lag 0 is at index L-1.
-        # We only need positive lags.
-        # This is slow per frame but robust.
-        corr = np.correlate(frame, frame, mode="full")[len(frame)-1:]
+    for start_idx in range(0, n_frames, BATCH_SIZE):
+        end_idx = min(start_idx + BATCH_SIZE, n_frames)
+        x_batch = x[start_idx:end_idx]
 
-        c0 = float(corr[0])
-        if c0 <= 1e-12:
-            continue
+        fft_len = n_fft
+        if _FFT_LIB is not np.fft and hasattr(_FFT_LIB, "next_fast_len"):
+             fft_len = _FFT_LIB.next_fast_len(n_fft)
 
-        # Normalize by zero-lag energy
-        norm_corr = corr / (c0 + 1e-12)
+        X = _FFT_LIB.rfft(x_batch, n=fft_len, axis=1)
+        P = X * np.conj(X)
+        ac = _FFT_LIB.irfft(P, n=fft_len, axis=1)
 
-        best_lag = 0
-        max_val = 0.0
+        # Truncate to frame length
+        ac = ac[:, :frame_length]
 
-        # Iterative peak picking with bounds checks
-        # range(lag_min, lag_max + 1) covers lags we want to check.
-        # We need neighbor access lag-1 and lag+1.
-        # Since lag_min >= 1, lag-1 >= 0.
-        # Since lag_max <= len-3, lag+1 <= len-2.
+        # 3. Normalize by lag-0 energy
+        c0 = ac[:, 0] + 1e-12
+        norm_corr = ac / c0[:, None]
 
-        for lag in range(lag_min, lag_max + 1):
-            val = float(norm_corr[lag])
-            if val > threshold and val > max_val:
-                # Safe neighbor check (local maximum)
-                if norm_corr[lag - 1] < val and norm_corr[lag + 1] < val:
-                    max_val = val
-                    best_lag = lag
+        # 4. Vectorized Peak Picking
+        # Range: [lag_min, lag_max] inclusive
+        center = norm_corr[:, lag_min : lag_max + 1]
+        left = norm_corr[:, lag_min - 1 : lag_max]
+        right = norm_corr[:, lag_min + 1 : lag_max + 2]
 
-        if best_lag > 0:
-            f0_out[i] = sr / best_lag
-            conf_out[i] = max_val
+        # Strict neighbor check + threshold
+        is_peak = (center > threshold) & (center > left) & (center > right)
+
+        # Find best peak (highest value) among valid peaks
+        masked_center = np.where(is_peak, center, -1.0)
+        best_indices = np.argmax(masked_center, axis=1)
+
+        row_indices = np.arange(len(x_batch))
+        max_vals = masked_center[row_indices, best_indices]
+
+        valid = max_vals > -1.0
+
+        if np.any(valid):
+            f0_batch = np.zeros(len(x_batch), dtype=np.float32)
+            conf_batch = np.zeros(len(x_batch), dtype=np.float32)
+
+            best_lags = best_indices[valid] + lag_min
+            f0_batch[valid] = sr / best_lags
+            conf_batch[valid] = max_vals[valid]
+
+            f0_out[start_idx:end_idx] = f0_batch
+            conf_out[start_idx:end_idx] = conf_batch
 
     return f0_out, conf_out
 
