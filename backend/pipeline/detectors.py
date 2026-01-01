@@ -54,6 +54,21 @@ def _safe_int(x: Any, default: int) -> int:
         return default
 
 
+def _get_n_frames(y_len: int, frame_length: int, hop_length: int) -> int:
+    """
+    Calculate the number of frames that _frame_audio would produce,
+    without allocating the frames array.
+    """
+    if y_len <= 0:
+        return 0
+    # If audio is shorter than one frame, _frame_audio pads it to exactly one frame
+    if y_len < frame_length:
+        return 1
+    # Otherwise, standard centered/sliding window logic
+    # Note: _frame_audio implementation uses: 1 + (len - frame) // hop
+    return 1 + (y_len - frame_length) // hop_length
+
+
 def _frame_audio(y: np.ndarray, frame_length: int, hop_length: int) -> np.ndarray:
     y = np.asarray(y, dtype=np.float32).reshape(-1)
     if len(y) <= 0:
@@ -1077,8 +1092,8 @@ class CREPEDetector(BasePitchDetector):
         y = np.asarray(audio, dtype=np.float32).reshape(-1)
 
         # Determine number of frames expected by pipeline
-        frames = _frame_audio(y, frame_length=self.n_fft, hop_length=self.hop_length)
-        n_frames = frames.shape[0]
+        # Optimization: calculate n_frames without allocating full frame array (saves ~100MB+ for long audio)
+        n_frames = _get_n_frames(len(y), frame_length=self.n_fft, hop_length=self.hop_length)
 
         if crepe is None:
             self._warn_once("no_crepe", "CREPE disabled: crepe not available.")
@@ -1124,6 +1139,10 @@ class CREPEDetector(BasePitchDetector):
             self._warn_once("crepe_error", f"CREPE inference failed: {e}")
             # Fallback to ACF if CREPE fails (e.g. missing tensorflow or shape error)
             # This ensures we always return *some* pitch data rather than silence.
+
+            # Now we actually need frames for the fallback
+            frames = _frame_audio(y, frame_length=self.n_fft, hop_length=self.hop_length)
+
             # Use SAFE fallback here
             f0, conf = _autocorr_pitch_per_frame_safe(frames, sr=self.sr, fmin=self.fmin, fmax=self.fmax, threshold=self.threshold)
             return f0, conf
